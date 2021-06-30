@@ -160,6 +160,17 @@ func (e *Editor) pollKeys() {
 			case tcell.KeyEnter:
 				e.addLineAt(e.cursor.x, e.cursor.y)
 				e.moveCursor(right)
+			case tcell.KeyBackspace:
+				e.moveCursor(left)
+				whitespaceness := whitespacePattern.MatchString(string([]rune{e.runeAt(e.cursor.x, e.cursor.y)}))
+				e.deleteAt(e.cursor.x, e.cursor.y)
+				for e.moveCursor(left) {
+					if whitespaceness != whitespacePattern.MatchString(string([]rune{e.runeAt(e.cursor.x, e.cursor.y)})) {
+						e.moveCursor(right)
+						break
+					}
+					e.deleteAt(e.cursor.x, e.cursor.y)
+				}
 			case tcell.KeyBackspace2:
 				if e.moveCursor(left) {
 					e.deleteAt(e.cursor.x, e.cursor.y)
