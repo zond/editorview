@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
@@ -13,6 +14,10 @@ var (
 	whitespacePattern = regexp.MustCompile("\\s+")
 )
 
+func Escape(s string) string {
+	return strings.ReplaceAll(s, "\\", "\\\\")
+}
+
 type Editor struct {
 	Screen tcell.Screen
 
@@ -21,6 +26,8 @@ type Editor struct {
 	// Line wrapped edited text: [line][rune]
 	wrappedBuffer [][]rune
 	// Index from [line][rune] of wrapped edited text to [rune, line] of content buffer.
+	// Every line has a single [2]int{-1, lineIdx} appended at the end to mark both cursor
+	// positions at the 'newline position' and lineIdx for empty lines.
 	wrappedBufferIndex [][][2]int
 	// number of wrappedBuffer lines hidden above screen
 	lineOffset int
@@ -37,7 +44,7 @@ func (e *Editor) runeAt(x, y int) rune {
 		if x < len(e.wrappedBuffer[lineIdx]) {
 			return e.wrappedBuffer[lineIdx][x]
 		}
-		return rune('\n')
+		return '\n'
 	}
 	return 0
 }
@@ -50,7 +57,8 @@ func (e *Editor) differentWhitespaceness(x, y int) func(int, int) bool {
 }
 
 func (e *Editor) indentation(y int) int {
-	idx := e.wrappedBufferIndex[y][0]
+	lineIdx := y + e.lineOffset
+	idx := e.wrappedBufferIndex[lineIdx][0]
 	for x, r := range e.contentBuffer[idx[1]] {
 		if whitespacePattern.MatchString(string([]rune{r})) {
 			return x
@@ -102,7 +110,7 @@ func (e *Editor) addLineAt(x, y int) {
 				e.contentBuffer[idx[1]+1:]...)...)...)
 }
 
-func (e *Editor) writeAt(r rune, x, y int) {
+func (e *Editor) deleteAt(x, y int) {
 	defer func() {
 		e.redraw()
 		e.Screen.Show()
@@ -110,13 +118,33 @@ func (e *Editor) writeAt(r rune, x, y int) {
 	lineIdx := y + e.lineOffset
 	idx := e.wrappedBufferIndex[lineIdx][x]
 	if idx[0] < 0 {
-		e.contentBuffer[idx[1]] = append(e.contentBuffer[idx[1]], r)
+		if lineIdx+1 < len(e.wrappedBufferIndex) {
+			e.contentBuffer = append(
+				e.contentBuffer[:idx[1]],
+				append(
+					[][]rune{append(e.contentBuffer[idx[1]], e.contentBuffer[idx[1]+1]...)},
+					e.contentBuffer[idx[1]+2:]...)...)
+		}
+		return
+	}
+	e.contentBuffer[idx[1]] = append(e.contentBuffer[idx[1]][:idx[0]], e.contentBuffer[idx[1]][idx[0]+1:]...)
+}
+
+func (e *Editor) writeAt(runes []rune, x, y int) {
+	defer func() {
+		e.redraw()
+		e.Screen.Show()
+	}()
+	lineIdx := y + e.lineOffset
+	idx := e.wrappedBufferIndex[lineIdx][x]
+	if idx[0] < 0 {
+		e.contentBuffer[idx[1]] = append(e.contentBuffer[idx[1]], runes...)
 		return
 	}
 	e.contentBuffer[idx[1]] = append(
 		e.contentBuffer[idx[1]][:idx[0]],
 		append(
-			[]rune{r},
+			runes,
 			e.contentBuffer[idx[1]][idx[0]:]...)...)
 }
 
@@ -132,8 +160,14 @@ func (e *Editor) pollKeys() {
 			case tcell.KeyEnter:
 				e.addLineAt(e.cursor.x, e.cursor.y)
 				e.moveCursor(right)
+			case tcell.KeyBackspace2:
+				if e.moveCursor(left) {
+					e.deleteAt(e.cursor.x, e.cursor.y)
+				}
+			case tcell.KeyDelete:
+				e.deleteAt(e.cursor.x, e.cursor.y)
 			case tcell.KeyRune:
-				e.writeAt(ev.Rune(), e.cursor.x, e.cursor.y)
+				e.writeAt([]rune(Escape(string([]rune{ev.Rune()}))), e.cursor.x, e.cursor.y)
 				e.moveCursor(right)
 			case tcell.KeyPgUp:
 				_, height := e.Screen.Size()
@@ -360,6 +394,128 @@ func (e *Editor) canMoveCursor(d direction) bool {
 	return false
 }
 
+type parseState int
+
+const (
+	visible parseState = iota
+	escapeStart
+	foreground
+	background
+)
+
+func (p parseState) String() string {
+	switch p {
+	case visible:
+		return "visible"
+	case escapeStart:
+		return "escapeStart"
+	case foreground:
+		return "foreground"
+	case background:
+		return "background"
+	}
+	return "unknown"
+}
+
+type token struct {
+	lineIdx int
+	runeIdx int
+	rune    *rune
+	style   *tcell.Style
+	newLine bool
+	eof     bool
+}
+
+func (t *token) setEof() *token {
+	t.rune = nil
+	t.style = nil
+	t.newLine = false
+	t.eof = true
+	return t
+}
+
+func (t *token) setNewLine() *token {
+	t.rune = nil
+	t.style = nil
+	t.newLine = true
+	t.eof = false
+	return t
+}
+
+func (t *token) setRune(r rune) *token {
+	t.rune = &r
+	t.style = nil
+	t.newLine = false
+	t.eof = false
+	return t
+}
+
+func (t *token) setStyle(s tcell.Style) *token {
+	t.rune = nil
+	t.style = &s
+	t.newLine = false
+	t.eof = false
+	return t
+}
+
+func (e *Editor) parseTokens(buffer [][]rune, cb func(*token)) {
+	style := tcell.StyleDefault
+	styleBuffer := []rune{}
+	setStyle := func(setter func(tcell.Color) tcell.Style) {
+		colint, err := strconv.ParseUint(string(styleBuffer), 16, 64)
+		styleBuffer = nil
+		if err == nil {
+			style = setter(tcell.NewHexColor(int32(colint)))
+		}
+	}
+	state := visible
+	token := token{}
+	line := []rune{}
+	r := rune(0)
+	for token.lineIdx, line = range buffer {
+		cb(token.setNewLine())
+		for token.runeIdx, r = range line {
+			switch state {
+			case visible:
+				if r == '\\' {
+					state = escapeStart
+				} else {
+					cb(token.setRune(r))
+				}
+			case escapeStart:
+				if r == '<' {
+					state = foreground
+				} else {
+					cb(token.setRune(r))
+					state = visible
+				}
+			case foreground:
+				switch r {
+				case ':':
+					setStyle(style.Foreground)
+					state = background
+				case '>':
+					setStyle(style.Foreground)
+					cb(token.setStyle(style))
+					state = visible
+				default:
+					styleBuffer = append(styleBuffer, r)
+				}
+			case background:
+				if r == '>' {
+					setStyle(style.Background)
+					cb(token.setStyle(style))
+					state = visible
+				} else {
+					styleBuffer = append(styleBuffer, r)
+				}
+			}
+		}
+		state = visible
+	}
+	cb(token.setEof())
+}
+
 func (e *Editor) redraw() {
 	e.wrappedBuffer = nil
 	e.wrappedBufferIndex = nil
@@ -370,36 +526,51 @@ func (e *Editor) redraw() {
 		return
 	}
 
-	eol := func(contentLineIdx, contentLineLen int) {
+	style := tcell.StyleDefault
+	styleIndex := [][]tcell.Style{}
+
+	beginLine := func() {
+		e.wrappedBuffer = append(e.wrappedBuffer, nil)
+		e.wrappedBufferIndex = append(e.wrappedBufferIndex, nil)
+		styleIndex = append(styleIndex, nil)
+	}
+	endLine := func(contentLineIdx int) {
 		e.wrappedBufferIndex[len(e.wrappedBufferIndex)-1] = append(
 			e.wrappedBufferIndex[len(e.wrappedBufferIndex)-1],
 			[2]int{
-				-contentLineLen,
+				-1,
 				contentLineIdx,
 			},
 		)
 	}
 
-	for contentLineIdx, contentLine := range e.contentBuffer {
-		e.wrappedBuffer = append(e.wrappedBuffer, nil)
-		e.wrappedBufferIndex = append(e.wrappedBufferIndex, nil)
-		for contentRuneIdx, contentRune := range contentLine {
-			e.wrappedBuffer[len(e.wrappedBuffer)-1] = append(e.wrappedBuffer[len(e.wrappedBuffer)-1], contentRune)
-			e.wrappedBufferIndex[len(e.wrappedBufferIndex)-1] = append(e.wrappedBufferIndex[len(e.wrappedBufferIndex)-1], [2]int{contentRuneIdx, contentLineIdx})
-			if len(e.wrappedBuffer[len(e.wrappedBuffer)-1]) > width-1 {
-				eol(contentLineIdx, len(contentLine))
-				e.wrappedBuffer = append(e.wrappedBuffer, nil)
-				e.wrappedBufferIndex = append(e.wrappedBufferIndex, nil)
+	e.parseTokens(e.contentBuffer, func(t *token) {
+		if t.newLine {
+			if t.lineIdx > 0 {
+				endLine(t.lineIdx - 1)
 			}
+			beginLine()
+		} else if t.rune != nil {
+			e.wrappedBuffer[len(e.wrappedBuffer)-1] = append(e.wrappedBuffer[len(e.wrappedBuffer)-1], *t.rune)
+			e.wrappedBufferIndex[len(e.wrappedBufferIndex)-1] = append(e.wrappedBufferIndex[len(e.wrappedBufferIndex)-1], [2]int{t.runeIdx, t.lineIdx})
+			styleIndex[len(styleIndex)-1] = append(styleIndex[len(styleIndex)-1], style)
+			if len(e.wrappedBuffer[len(e.wrappedBuffer)-1]) > width-1 {
+				endLine(t.lineIdx)
+				beginLine()
+			}
+		} else if t.style != nil {
+			style = *t.style
+		} else if t.eof {
+			endLine(t.lineIdx)
 		}
-		eol(contentLineIdx, len(contentLine))
-	}
+	})
+
 	for wrappedLineIdx, wrappedLine := range e.wrappedBuffer[e.lineOffset:] {
 		for wrappedRuneIdx, wrappedRune := range wrappedLine {
-			e.Screen.SetContent(wrappedRuneIdx, wrappedLineIdx, wrappedRune, nil, tcell.StyleDefault)
+			e.Screen.SetContent(wrappedRuneIdx, wrappedLineIdx, wrappedRune, nil, styleIndex[wrappedLineIdx+e.lineOffset][wrappedRuneIdx])
 		}
 		for x := len(wrappedLine); x < width; x++ {
-			e.Screen.SetContent(x, wrappedLineIdx, rune(' '), nil, tcell.StyleDefault)
+			e.Screen.SetContent(x, wrappedLineIdx, ' ', nil, tcell.StyleDefault)
 		}
 		if wrappedLineIdx+1 > height-1 {
 			break
@@ -407,7 +578,7 @@ func (e *Editor) redraw() {
 	}
 	for y := len(e.wrappedBuffer) - e.lineOffset; y < height; y++ {
 		for x := 0; x < width; x++ {
-			e.Screen.SetContent(x, y, rune(' '), nil, tcell.StyleDefault)
+			e.Screen.SetContent(x, y, ' ', nil, tcell.StyleDefault)
 		}
 	}
 }
