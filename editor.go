@@ -189,6 +189,8 @@ func (e *Editor) content(start, end *point) (filtered []rune, matchingRange [2]i
 		} else if t.newLine {
 			index = append(index, t.pos)
 			filtered = append(filtered, '\n')
+		} else if t.eof {
+			index = append(index, t.pos)
 		}
 	})
 	return filtered, matchingRange, index
@@ -213,6 +215,8 @@ func (e *Editor) replace(raw bool, p *regexp.Regexp, repl string, query func(mat
 				content = append(content, '\n')
 			}
 		}
+		lastPoint := contentIndex[len(contentIndex)-1]
+		contentIndex = append(contentIndex, point{x: lastPoint.x + 1, y: lastPoint.y})
 	} else {
 		content, _, contentIndex = e.content(nil, nil)
 	}
@@ -220,11 +224,9 @@ func (e *Editor) replace(raw bool, p *regexp.Regexp, repl string, query func(mat
 		processedContent := content[contentOffset:]
 		processedContentIndex := contentIndex[contentOffset:]
 		matchIndex := p.FindStringIndex(string(processedContent))
-		log.Printf("replace got matchIndex %#v, content has %v runes", matchIndex, len(content))
 		if matchIndex == nil {
 			return
 		}
-		// TODO(zond): This goes out of bounds if the match is for the ENTIRE buffer.
 		contentStartIndex, contentEndIndex := processedContentIndex[matchIndex[0]], processedContentIndex[matchIndex[1]]
 		if query(string(processedContent)[matchIndex[0]:matchIndex[1]], contentStartIndex, contentEndIndex) {
 			replacement := p.ReplaceAllString(string(processedContent)[matchIndex[0]:matchIndex[1]], repl)
@@ -267,6 +269,12 @@ func (e *Editor) writeAt(runes []rune, screenPoint point) {
 		append(
 			runes,
 			e.contentBuffer[p.y][p.x:]...)...)
+}
+
+func (e *Editor) debuglog() {
+	for _, l := range e.contentBuffer {
+		log.Printf("%q", string(l))
+	}
 }
 
 func (e *Editor) pollKeys() {
@@ -382,7 +390,6 @@ func (e *Editor) pollKeys() {
 				}
 			}
 		}
-		// TODO(zond): Selecting somehow hides escape chars like & and < in the buffer.
 		if e.selecting {
 			if selectFrom == nil {
 				e.selecting = false
@@ -663,13 +670,15 @@ func (e *Editor) parseTokens(buffer [][]rune, cb func(*token)) {
 
 	token := token{}
 	line := []rune{}
+	tmpX := 0
 	r := rune(0)
 
 	cb(token.setStart())
 	for token.pos.y, line = range buffer {
-		for token.pos.x, r = range line {
+		for tmpX, r = range line {
 			switch state {
 			case visible:
+				token.pos.x = tmpX
 				switch r {
 				case '&':
 					stateBuffer = []rune{r}
