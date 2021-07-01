@@ -18,6 +18,7 @@ var (
 	selectFromPattern = regexp.MustCompile(selectFromToken)
 	selectToToken     = "<select-to>"
 	selectToPattern   = regexp.MustCompile(selectToToken)
+	selectionPattern  = regexp.MustCompile(fmt.Sprintf("(%s|%s).*(%s|%s)", selectToPattern, selectFromPattern, selectToPattern, selectFromPattern))
 	colorTagPattern   = regexp.MustCompile("<color:([A-Fa-f0-9]{6,6}):([A-Fa-f0-9]{6,6})>")
 )
 
@@ -306,7 +307,17 @@ func (e *Editor) pollKeys() {
 					e.deleteAt(e.cursor)
 				}
 			case tcell.KeyDelete:
-				e.deleteAt(e.cursor)
+				var newPoint *point
+				e.replace(true, selectionPattern, "", func(s string, from point, to point) bool {
+					newPoint = &from
+					return true
+				})
+				if newPoint == nil {
+					e.deleteAt(e.cursor)
+				} else {
+					e.cursor = *newPoint
+					e.setCursor()
+				}
 			case tcell.KeyRune:
 				e.writeAt([]rune(Escape(string([]rune{ev.Rune()}))), e.cursor)
 				e.moveCursor(right)
@@ -388,6 +399,15 @@ func (e *Editor) pollKeys() {
 				} else {
 					e.moveCursor(right)
 				}
+			case tcell.KeyEsc:
+				e.selecting = false
+				selectFrom = nil
+				e.replace(true, selectToPattern, "", func(string, point, point) bool {
+					return true
+				})
+				e.replace(true, selectFromPattern, "", func(string, point, point) bool {
+					return true
+				})
 			}
 		}
 		if e.selecting {
