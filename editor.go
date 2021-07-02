@@ -306,6 +306,13 @@ func (e *Editor) pollKeys() {
 				if e.moveCursor(left) {
 					e.deleteAt(e.cursor)
 				}
+			case tcell.KeyTab:
+				e.writeAt([]rune{' '}, e.cursor)
+				e.moveCursor(right)
+				for e.cursor.x%4 != 0 {
+					e.writeAt([]rune{' '}, e.cursor)
+					e.moveCursor(right)
+				}
 			case tcell.KeyDelete:
 				var newPoint *point
 				e.replace(true, selectionPattern, "", func(s string, from point, to point) bool {
