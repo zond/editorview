@@ -18,7 +18,7 @@ var (
 	selectFromPattern = regexp.MustCompile(selectFromToken)
 	selectToToken     = "<select-to>"
 	selectToPattern   = regexp.MustCompile(selectToToken)
-	selectionPattern  = regexp.MustCompile(fmt.Sprintf("(%s|%s).*(%s|%s)", selectToPattern, selectFromPattern, selectToPattern, selectFromPattern))
+	selectionPattern  = regexp.MustCompile(fmt.Sprintf("(?s)(%s|%s).*(%s|%s)", selectToPattern, selectFromPattern, selectToPattern, selectFromPattern))
 	colorTagPattern   = regexp.MustCompile("<color:([A-Fa-f0-9]{6,6}):([A-Fa-f0-9]{6,6})>")
 )
 
@@ -143,6 +143,9 @@ func (e *Editor) addLineAt(screenPoint point) {
 }
 
 func (e *Editor) deleteFromContentBuffer(p point) {
+	defer func() {
+		e.redraw()
+	}()
 	if p.x < 0 {
 		if p.y+1 < len(e.contentBuffer) {
 			e.contentBuffer = append(
@@ -153,15 +156,15 @@ func (e *Editor) deleteFromContentBuffer(p point) {
 		}
 		return
 	}
-	if e.contentBuffer[p.y][p.x] == ';' {
-		if p.x > 3 && string(e.contentBuffer[p.y][p.x-4:p.x+1]) == "&amp;" {
-			e.contentBuffer[p.y] = append(e.contentBuffer[p.y][:p.x-4], e.contentBuffer[p.y][p.x+1:]...)
+	if e.contentBuffer[p.y][p.x] == '&' {
+		if len(e.contentBuffer[p.y])-p.x > 5 && string(e.contentBuffer[p.y][p.x:p.x+5]) == "&amp;" {
+			e.contentBuffer[p.y] = append(e.contentBuffer[p.y][:p.x], e.contentBuffer[p.y][p.x+5:]...)
 			return
-		} else if p.x > 3 && string(e.contentBuffer[p.y][p.x-3:p.x+1]) == "&gt;" {
-			e.contentBuffer[p.y] = append(e.contentBuffer[p.y][:p.x-3], e.contentBuffer[p.y][p.x+1:]...)
+		} else if len(e.contentBuffer[p.y])-p.x > 4 && string(e.contentBuffer[p.y][p.x:p.x+4]) == "&gt;" {
+			e.contentBuffer[p.y] = append(e.contentBuffer[p.y][:p.x], e.contentBuffer[p.y][p.x+4:]...)
 			return
-		} else if p.x > 3 && string(e.contentBuffer[p.y][p.x-3:p.x+1]) == "&lt;" {
-			e.contentBuffer[p.y] = append(e.contentBuffer[p.y][:p.x-3], e.contentBuffer[p.y][p.x+1:]...)
+		} else if len(e.contentBuffer[p.y])-p.x > 4 && string(e.contentBuffer[p.y][p.x:p.x+4]) == "&lt;" {
+			e.contentBuffer[p.y] = append(e.contentBuffer[p.y][:p.x], e.contentBuffer[p.y][p.x+4:]...)
 			return
 		}
 	}
@@ -169,9 +172,6 @@ func (e *Editor) deleteFromContentBuffer(p point) {
 }
 
 func (e *Editor) deleteAt(screenPoint point) {
-	defer func() {
-		e.redraw()
-	}()
 	e.deleteFromContentBuffer(e.wrappedBufferIndex[screenPoint.y+e.lineOffset][screenPoint.x])
 }
 
