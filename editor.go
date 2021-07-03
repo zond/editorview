@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
 var (
@@ -69,8 +70,11 @@ type Editor struct {
 	// number of wrappedBuffer lines hidden above screen
 	lineOffset int
 
-	selecting bool
-	cursor    point
+	selecting    bool
+	selectBuffer []rune
+	undoPatches  []diffmachpatch.Patch
+	redoPatches  []diffmatchpatch.Patch
+	cursor       point
 }
 
 func (e *Editor) runeAt(screenPoint point) rune {
@@ -314,16 +318,22 @@ func (e *Editor) pollKeys() {
 					e.moveCursor(right)
 				}
 			case tcell.KeyDelete:
-				var newPoint *point
-				e.replace(true, selectionPattern, "", func(s string, from point, to point) bool {
-					newPoint = &from
+				var from *point
+				var to *point
+				e.replace(true, selectionPattern, "", func(s string, f point, t point) bool {
+					from = &f
+					to = &t
 					return true
 				})
-				if newPoint == nil {
+				if from == nil || to == nil {
 					e.deleteAt(e.cursor)
 				} else {
-					e.cursor = *newPoint
-					e.setCursor()
+					ps := points{e.cursor, *from, *to}
+					sort.Sort(ps)
+					if ps[1] == e.cursor {
+						e.cursor = *from
+						e.setCursor()
+					}
 				}
 			case tcell.KeyRune:
 				e.writeAt([]rune(Escape(string([]rune{ev.Rune()}))), e.cursor)
@@ -367,7 +377,17 @@ func (e *Editor) pollKeys() {
 				e.cursor.x = len(e.wrappedBuffer[e.cursor.y])
 				e.redraw()
 				e.setCursor()
+			case tcell.KeyCtrlZ:
+				e.undo()
+			case tcell.KeyCtrlY:
+				e.redo()
 			case tcell.KeyCtrlC:
+				e.copySelection()
+			case tcell.KeyCtrlX:
+				e.cutSelection()
+			case tcell.KeyCtrlV:
+				e.pasteSelection()
+			case tcell.KeyCtrlW:
 				e.Screen.Fini()
 				return
 			case tcell.KeyUp:
