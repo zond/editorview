@@ -1,6 +1,7 @@
 package editorview
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"math"
@@ -19,7 +20,7 @@ var (
 	selectFromPattern = regexp.MustCompile(selectFromToken)
 	selectToToken     = "<select-to>"
 	selectToPattern   = regexp.MustCompile(selectToToken)
-	selectionPattern  = regexp.MustCompile(fmt.Sprintf("(?s)(%s|%s).*(%s|%s)", selectToPattern, selectFromPattern, selectToPattern, selectFromPattern))
+	selectionPattern  = regexp.MustCompile(fmt.Sprintf("(?s)(%s|%s)(.*)(%s|%s)", selectToPattern, selectFromPattern, selectToPattern, selectFromPattern))
 	colorTagPattern   = regexp.MustCompile("<color:([A-Fa-f0-9]{6,6}):([A-Fa-f0-9]{6,6})>")
 )
 
@@ -70,11 +71,11 @@ type Editor struct {
 	// number of wrappedBuffer lines hidden above screen
 	lineOffset int
 
-	selecting    bool
-	selectBuffer []rune
-	undoPatches  []diffmachpatch.Patch
-	redoPatches  []diffmatchpatch.Patch
-	cursor       point
+	selecting   bool
+	pasteBuffer [][]rune
+	undoPatches []diffmatchpatch.Patch
+	redoPatches []diffmatchpatch.Patch
+	cursor      point
 }
 
 func (e *Editor) runeAt(screenPoint point) rune {
@@ -179,6 +180,20 @@ func (e *Editor) deleteAt(screenPoint point) {
 	e.deleteFromContentBuffer(e.wrappedBufferIndex[screenPoint.y+e.lineOffset][screenPoint.x])
 }
 
+func (e *Editor) plain(r [][]rune) [][]rune {
+	res := [][]rune{}
+	e.parseTokens(r, func(t *token) {
+		if t.start {
+			res = append(res, nil)
+		} else if t.rune != nil {
+			res[len(res)-1] = append(res[len(res)-1], *t.rune)
+		} else if t.newLine {
+			res = append(res, nil)
+		}
+	})
+	return res
+}
+
 func (e *Editor) content(start, end *point) (filtered []rune, matchingRange [2]int, index points) {
 	matchingRange = [2]int{-1, -1}
 	e.parseTokens(e.contentBuffer, func(t *token) {
@@ -251,11 +266,11 @@ func (e *Editor) replace(raw bool, p *regexp.Regexp, repl string, query func(mat
 				}
 				e.writeAt([]rune(replacement), processedContentIndex[matchIndex[0]])
 			}
-			contentOffset += matchIndex[1]
 			e.redraw()
-			if contentOffset > len(content)-1 {
-				return
-			}
+		}
+		contentOffset += matchIndex[1]
+		if contentOffset > len(content)-1 {
+			return
 		}
 	}
 }
@@ -280,6 +295,41 @@ func (e *Editor) debuglog() {
 	for _, l := range e.contentBuffer {
 		log.Printf("%q", string(l))
 	}
+}
+
+func (e *Editor) copySelection() {
+	e.replace(true, selectionPattern, "", func(s string, f point, t point) bool {
+		if match := selectionPattern.FindStringSubmatch(s); match != nil {
+			e.pasteBuffer = e.plain(e.stringToRunes(match[2]))
+		}
+		return false
+	})
+}
+
+func (e *Editor) runesToString(rs [][]rune) string {
+	res := &bytes.Buffer{}
+	for idx, line := range rs {
+		fmt.Fprintf(res, "%v", string(line))
+		if idx+1 < len(rs) {
+			fmt.Fprintln(res)
+		}
+	}
+	return res.String()
+}
+
+func (e *Editor) removeSelection(cpy bool) (from, to *point) {
+	e.replace(true, selectionPattern, "", func(s string, f point, t point) bool {
+		if cpy {
+			if match := selectionPattern.FindStringSubmatch(s); match != nil {
+				e.pasteBuffer = e.plain(e.stringToRunes(match[2]))
+				log.Printf("pastebuffer is now: %q", e.runesToString(e.pasteBuffer))
+			}
+		}
+		from = &f
+		to = &t
+		return true
+	})
+	return from, to
 }
 
 func (e *Editor) pollKeys() {
@@ -318,13 +368,7 @@ func (e *Editor) pollKeys() {
 					e.moveCursor(right)
 				}
 			case tcell.KeyDelete:
-				var from *point
-				var to *point
-				e.replace(true, selectionPattern, "", func(s string, f point, t point) bool {
-					from = &f
-					to = &t
-					return true
-				})
+				from, to := e.removeSelection(false)
 				if from == nil || to == nil {
 					e.deleteAt(e.cursor)
 				} else {
@@ -332,8 +376,8 @@ func (e *Editor) pollKeys() {
 					sort.Sort(ps)
 					if ps[1] == e.cursor {
 						e.cursor = *from
-						e.setCursor()
 					}
+					e.setCursor()
 				}
 			case tcell.KeyRune:
 				e.writeAt([]rune(Escape(string([]rune{ev.Rune()}))), e.cursor)
@@ -378,15 +422,27 @@ func (e *Editor) pollKeys() {
 				e.redraw()
 				e.setCursor()
 			case tcell.KeyCtrlZ:
-				e.undo()
+				// TODO(zond): IMPLEMENT ME
 			case tcell.KeyCtrlY:
-				e.redo()
+				// TODO(zond): IMPLEMENT ME
 			case tcell.KeyCtrlC:
 				e.copySelection()
 			case tcell.KeyCtrlX:
-				e.cutSelection()
+				e.removeSelection(true)
+				e.setCursor()
 			case tcell.KeyCtrlV:
-				e.pasteSelection()
+				if len(e.pasteBuffer) > 0 {
+					for idx, line := range e.pasteBuffer {
+						e.writeAt([]rune(Escape(string(line))), e.cursor)
+						for _ = range line {
+							e.moveCursor(right)
+						}
+						if idx+1 < len(e.pasteBuffer) {
+							e.addLineAt(e.cursor)
+							e.moveCursor(right)
+						}
+					}
+				}
 			case tcell.KeyCtrlW:
 				e.Screen.Fini()
 				return
@@ -866,11 +922,16 @@ func (e *Editor) redraw() {
 	}
 }
 
-func (e *Editor) setContent(s string) {
-	e.contentBuffer = nil
+func (e *Editor) stringToRunes(s string) [][]rune {
+	res := [][]rune{}
 	for _, line := range strings.Split(s, "\n") {
-		e.contentBuffer = append(e.contentBuffer, []rune(line))
+		res = append(res, []rune(line))
 	}
+	return res
+}
+
+func (e *Editor) setContent(s string) {
+	e.contentBuffer = e.stringToRunes(s)
 }
 
 func (e *Editor) Edit(s string) (string, error) {
