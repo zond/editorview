@@ -206,52 +206,26 @@ func (e *Editor) plain(r [][]rune) [][]rune {
 	return res
 }
 
-func (e *Editor) content(start, end *point) (filtered []rune, matchingRange [2]int, index points) {
-	matchingRange = [2]int{-1, -1}
-	e.parseTokens(e.contentBuffer, func(t *token) {
-		if start != nil && matchingRange[0] != -1 && !(points{*start, t.pos}.Less(0, 1)) {
-			matchingRange[0] = len(filtered)
-		}
-		if end != nil && matchingRange[1] != -1 && !(points{*end, t.pos}.Less(0, 1)) {
-			matchingRange[0] = len(filtered)
-		}
-		if t.rune != nil {
-			index = append(index, t.pos)
-			filtered = append(filtered, *t.rune)
-		} else if t.newLine {
-			index = append(index, t.pos)
-			filtered = append(filtered, '\n')
-		} else if t.eof {
-			index = append(index, t.pos)
-		}
-	})
-	return filtered, matchingRange, index
-}
-
-func (e *Editor) replace(raw bool, p *regexp.Regexp, repl string, query func(match string, contentBufferStart, contentBufferEnd point) bool) {
+func (e *Editor) replace(p *regexp.Regexp, repl string, query func(match string, contentBufferStart, contentBufferEnd point) bool) {
 	content := []rune{}
 	contentIndex := points{}
 	contentOffset := 0
-	if raw {
-		x := 0
-		y := 0
-		line := []rune{}
-		r := rune(0)
-		for y, line = range e.contentBuffer {
-			for x, r = range line {
-				contentIndex = append(contentIndex, point{x: x, y: y})
-				content = append(content, r)
-			}
-			if y+1 < len(e.contentBuffer) {
-				contentIndex = append(contentIndex, point{x: x + 1, y: y})
-				content = append(content, '\n')
-			}
+	x := 0
+	y := 0
+	line := []rune{}
+	r := rune(0)
+	for y, line = range e.contentBuffer {
+		for x, r = range line {
+			contentIndex = append(contentIndex, point{x: x, y: y})
+			content = append(content, r)
 		}
-		lastPoint := contentIndex[len(contentIndex)-1]
-		contentIndex = append(contentIndex, point{x: lastPoint.x + 1, y: lastPoint.y})
-	} else {
-		content, _, contentIndex = e.content(nil, nil)
+		if y+1 < len(e.contentBuffer) {
+			contentIndex = append(contentIndex, point{x: x + 1, y: y})
+			content = append(content, '\n')
+		}
 	}
+	lastPoint := contentIndex[len(contentIndex)-1]
+	contentIndex = append(contentIndex, point{x: lastPoint.x + 1, y: lastPoint.y})
 	for {
 		processedContent := content[contentOffset:]
 		processedContentIndex := contentIndex[contentOffset:]
@@ -262,22 +236,14 @@ func (e *Editor) replace(raw bool, p *regexp.Regexp, repl string, query func(mat
 		contentStartIndex, contentEndIndex := processedContentIndex[matchIndex[0]], processedContentIndex[matchIndex[1]]
 		if query(string(processedContent)[matchIndex[0]:matchIndex[1]], contentStartIndex, contentEndIndex) {
 			replacement := p.ReplaceAllString(string(processedContent)[matchIndex[0]:matchIndex[1]], repl)
-			if raw {
-				content = append(
-					content[:contentOffset],
+			content = append(
+				content[:contentOffset],
+				append(
+					processedContent[:matchIndex[0]],
 					append(
-						processedContent[:matchIndex[0]],
-						append(
-							[]rune(replacement),
-							processedContent[matchIndex[1]:]...)...)...)
-				e.contentBuffer = e.stringToRunes(string(content))
-			} else {
-				for i := matchIndex[1] - 1; i >= matchIndex[0]; i-- {
-					p := processedContentIndex[i]
-					e.deleteFromContentBuffer(p)
-				}
-				e.writeAt([]rune(replacement), processedContentIndex[matchIndex[0]])
-			}
+						[]rune(replacement),
+						processedContent[matchIndex[1]:]...)...)...)
+			e.contentBuffer = e.stringToRunes(string(content))
 			e.redraw()
 		}
 		contentOffset += matchIndex[1]
@@ -310,7 +276,7 @@ func (e *Editor) debuglog() {
 }
 
 func (e *Editor) copySelection() {
-	e.replace(true, selectionPattern, "", func(s string, f point, t point) bool {
+	e.replace(selectionPattern, "", func(s string, f point, t point) bool {
 		if match := selectionPattern.FindStringSubmatch(s); match != nil {
 			e.pasteBuffer = e.plain(e.stringToRunes(match[2]))
 		}
@@ -330,7 +296,7 @@ func (e *Editor) runesToString(rs [][]rune) string {
 }
 
 func (e *Editor) removeSelection(cpy bool) (from, to *point, removedRunes int) {
-	e.replace(true, selectionPattern, "", func(s string, f point, t point) bool {
+	e.replace(selectionPattern, "", func(s string, f point, t point) bool {
 		if cpy {
 			if match := selectionPattern.FindStringSubmatch(s); match != nil {
 				e.pasteBuffer = e.plain(e.stringToRunes(match[2]))
@@ -526,10 +492,10 @@ func (e *Editor) pollKeys() {
 			case tcell.KeyEsc:
 				e.selecting = false
 				selectFrom = nil
-				e.replace(true, selectToPattern, "", func(string, point, point) bool {
+				e.replace(selectToPattern, "", func(string, point, point) bool {
 					return true
 				})
-				e.replace(true, selectFromPattern, "", func(string, point, point) bool {
+				e.replace(selectFromPattern, "", func(string, point, point) bool {
 					return true
 				})
 			}
@@ -538,7 +504,7 @@ func (e *Editor) pollKeys() {
 			if selectFrom == nil {
 				e.selecting = false
 			} else {
-				e.replace(true, selectToPattern, "", func(string, point, point) bool {
+				e.replace(selectToPattern, "", func(string, point, point) bool {
 					return true
 				})
 				e.writeAt([]rune(selectToToken), e.cursor)
@@ -546,10 +512,10 @@ func (e *Editor) pollKeys() {
 		} else {
 			if selectFrom != nil {
 				e.selecting = true
-				e.replace(true, selectToPattern, "", func(string, point, point) bool {
+				e.replace(selectToPattern, "", func(string, point, point) bool {
 					return true
 				})
-				e.replace(true, selectFromPattern, "", func(string, point, point) bool {
+				e.replace(selectFromPattern, "", func(string, point, point) bool {
 					return true
 				})
 				ps := points{*selectFrom, e.cursor}
