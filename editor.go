@@ -346,6 +346,7 @@ func (e *Editor) pollKeys() {
 						e.deleteAt(e.cursor)
 					}
 				} else {
+					// TODO(zond): Make the cursor end up in a logical place.
 					e.setCursor()
 				}
 			case tcell.KeyDelete:
@@ -353,6 +354,7 @@ func (e *Editor) pollKeys() {
 				if from == nil || to == nil || removed == 0 {
 					e.deleteAt(e.cursor)
 				} else {
+					// TODO(zond): Make the cursor end up in a logical place.
 					e.setCursor()
 				}
 			case tcell.KeyTab:
