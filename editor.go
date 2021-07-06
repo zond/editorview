@@ -33,6 +33,12 @@ type point struct {
 	y int
 }
 
+func (p point) dist(o point) float64 {
+	dx := float64(p.x - o.x)
+	dy := float64(p.y - o.y)
+	return math.Sqrt(dx*dx + dy*dy)
+}
+
 func (p point) clone() *point {
 	cpy := p
 	return &cpy
@@ -57,6 +63,11 @@ func (p points) Swap(i, j int) {
 	p[j], p[i] = p[i], p[j]
 }
 
+type patch struct {
+	cursor  point
+	patches []diffmatchpatch.Patch
+}
+
 type Editor struct {
 	Screen tcell.Screen
 
@@ -73,9 +84,10 @@ type Editor struct {
 
 	selecting   bool
 	pasteBuffer [][]rune
-	undoPatches []diffmatchpatch.Patch
-	redoPatches []diffmatchpatch.Patch
+	undoPatches []patch
+	redoPatches []patch
 	cursor      point
+	differ      *diffmatchpatch.DiffMatchPatch
 }
 
 func (e *Editor) runeAt(screenPoint point) rune {
@@ -258,7 +270,7 @@ func (e *Editor) replace(raw bool, p *regexp.Regexp, repl string, query func(mat
 						append(
 							[]rune(replacement),
 							processedContent[matchIndex[1]:]...)...)...)
-				e.setContent(string(content))
+				e.contentBuffer = e.stringToRunes(string(content))
 			} else {
 				for i := matchIndex[1] - 1; i >= matchIndex[0]; i-- {
 					p := processedContentIndex[i]
@@ -317,25 +329,30 @@ func (e *Editor) runesToString(rs [][]rune) string {
 	return res.String()
 }
 
-func (e *Editor) removeSelection(cpy bool) (from, to *point) {
+func (e *Editor) removeSelection(cpy bool) (from, to *point, removedRunes int) {
 	e.replace(true, selectionPattern, "", func(s string, f point, t point) bool {
 		if cpy {
 			if match := selectionPattern.FindStringSubmatch(s); match != nil {
 				e.pasteBuffer = e.plain(e.stringToRunes(match[2]))
-				log.Printf("pastebuffer is now: %q", e.runesToString(e.pasteBuffer))
 			}
 		}
+		removedRunes = len([]rune(e.runesToString(e.plain(e.stringToRunes(s)))))
 		from = &f
 		to = &t
 		return true
 	})
-	return from, to
+	return from, to, removedRunes
 }
 
 func (e *Editor) pollKeys() {
 	var selectFrom *point
 	for {
+		prevContent := e.runesToString(e.contentBuffer)
+		prevCursor := e.cursor
+		storeUndo := true
+		clearRedo := true
 		selectFrom = nil
+
 		switch ev := e.Screen.PollEvent().(type) {
 		case *tcell.EventResize:
 			e.redraw()
@@ -357,8 +374,20 @@ func (e *Editor) pollKeys() {
 					e.deleteAt(e.cursor)
 				}
 			case tcell.KeyBackspace2:
-				if e.moveCursor(left) {
+				from, to, removed := e.removeSelection(false)
+				if from == nil || to == nil || removed == 0 {
+					if e.moveCursor(left) {
+						e.deleteAt(e.cursor)
+					}
+				} else {
+					e.setCursor()
+				}
+			case tcell.KeyDelete:
+				from, to, removed := e.removeSelection(false)
+				if from == nil || to == nil || removed == 0 {
 					e.deleteAt(e.cursor)
+				} else {
+					e.setCursor()
 				}
 			case tcell.KeyTab:
 				e.writeAt([]rune{' '}, e.cursor)
@@ -366,18 +395,6 @@ func (e *Editor) pollKeys() {
 				for e.cursor.x%4 != 0 {
 					e.writeAt([]rune{' '}, e.cursor)
 					e.moveCursor(right)
-				}
-			case tcell.KeyDelete:
-				from, to := e.removeSelection(false)
-				if from == nil || to == nil {
-					e.deleteAt(e.cursor)
-				} else {
-					ps := points{e.cursor, *from, *to}
-					sort.Sort(ps)
-					if ps[1] == e.cursor {
-						e.cursor = *from
-					}
-					e.setCursor()
 				}
 			case tcell.KeyRune:
 				e.writeAt([]rune(Escape(string([]rune{ev.Rune()}))), e.cursor)
@@ -422,9 +439,33 @@ func (e *Editor) pollKeys() {
 				e.redraw()
 				e.setCursor()
 			case tcell.KeyCtrlZ:
-				// TODO(zond): IMPLEMENT ME
+				storeUndo = false
+				clearRedo = false
+				if len(e.undoPatches) > 0 {
+					toApply := e.undoPatches[len(e.undoPatches)-1]
+					e.undoPatches = e.undoPatches[:len(e.undoPatches)-1]
+					newContent, applied := e.differ.PatchApply(toApply.patches, prevContent)
+					if applied[0] {
+						e.redoPatches = append(e.redoPatches, patch{patches: e.differ.PatchMake(newContent, prevContent), cursor: toApply.cursor})
+
+						e.contentBuffer = e.stringToRunes(newContent)
+						e.cursor = toApply.cursor
+
+						e.redraw()
+					}
+				}
 			case tcell.KeyCtrlY:
-				// TODO(zond): IMPLEMENT ME
+				clearRedo = false
+				if len(e.redoPatches) > 0 {
+					toApply := e.redoPatches[len(e.redoPatches)-1]
+					e.redoPatches = e.redoPatches[:len(e.redoPatches)-1]
+					newContent, applied := e.differ.PatchApply(toApply.patches, prevContent)
+					if applied[0] {
+						e.contentBuffer = e.stringToRunes(newContent)
+						e.cursor = toApply.cursor
+						e.redraw()
+					}
+				}
 			case tcell.KeyCtrlC:
 				e.copySelection()
 			case tcell.KeyCtrlX:
@@ -522,6 +563,14 @@ func (e *Editor) pollKeys() {
 					}
 				}
 			}
+		}
+		if storeUndo {
+			if newContent := e.runesToString(e.contentBuffer); newContent != prevContent {
+				e.undoPatches = append(e.undoPatches, patch{patches: e.differ.PatchMake(newContent, prevContent), cursor: prevCursor})
+			}
+		}
+		if clearRedo {
+			e.redoPatches = nil
 		}
 		e.Screen.ShowCursor(e.cursor.x, e.cursor.y)
 		e.Screen.Show()
@@ -935,7 +984,8 @@ func (e *Editor) setContent(s string) {
 }
 
 func (e *Editor) Edit(s string) (string, error) {
-	e.setContent(s)
+	e.differ = diffmatchpatch.New()
+	e.contentBuffer = e.stringToRunes(s)
 	e.redraw()
 	e.setCursor()
 	e.Screen.Show()
