@@ -75,7 +75,8 @@ type patch struct {
 }
 
 type Editor struct {
-	Screen tcell.Screen
+	Screen      tcell.Screen
+	EventFilter func(tcell.Event) []tcell.Event
 
 	// Edited text: [line][rune]
 	rawBuffer [][]rune
@@ -190,7 +191,11 @@ func (e *Editor) deleteAt(screenPoint point) {
 	e.rawBuffer[p.y] = concatRunes(e.rawBuffer[p.y][:p.x], e.rawBuffer[p.y][p.x+1:])
 }
 
-func (e *Editor) plain(r [][]rune) [][]rune {
+func PlainText(s string) string {
+	return runesToString(plain(stringToRunes(s)))
+}
+
+func plain(r [][]rune) [][]rune {
 	res := [][]rune{}
 	parseTokens(r, func(t *token) {
 		if t.start {
@@ -345,7 +350,7 @@ func (e *Editor) debuglog() {
 func (e *Editor) copySelection() {
 	e.replace(true, selectionPattern, "", func(s string, rawSeg, screenSeg segment) bool {
 		if match := selectionPattern.FindStringSubmatch(s); match != nil {
-			e.pasteBuffer = e.plain(stringToRunes(match[2]))
+			e.pasteBuffer = plain(stringToRunes(match[2]))
 		}
 		return false
 	})
@@ -366,11 +371,11 @@ func (e *Editor) removeSelection(cpy bool) (removedScreenSeg segment, removedRun
 	e.replace(true, selectionPattern, "", func(s string, rawSeg, screenSeg segment) bool {
 		if cpy {
 			if match := selectionPattern.FindStringSubmatch(s); match != nil {
-				e.pasteBuffer = e.plain(stringToRunes(match[2]))
+				e.pasteBuffer = plain(stringToRunes(match[2]))
 			}
 		}
 		removedScreenSeg = screenSeg
-		removedRunes = []rune(runesToString(e.plain(stringToRunes(s))))
+		removedRunes = []rune(runesToString(plain(stringToRunes(s))))
 		return true
 	})
 	return
@@ -397,233 +402,239 @@ func (e *Editor) backCursor(removedSeg segment, removedRunes []rune) {
 func (e *Editor) pollKeys() {
 	var selectFrom *point
 	for {
-		prevContent := runesToString(e.rawBuffer)
-		prevCursor := e.cursor
-		storeUndo := true
-		clearRedo := true
-		selectFrom = nil
+		evs := []tcell.Event{e.Screen.PollEvent()}
+		if e.EventFilter != nil {
+			evs = e.EventFilter(evs[0])
+		}
+		for _, untypedEv := range evs {
+			prevContent := runesToString(e.rawBuffer)
+			prevCursor := e.cursor
+			storeUndo := true
+			clearRedo := true
+			selectFrom = nil
 
-		switch ev := e.Screen.PollEvent().(type) {
-		case *tcell.EventResize:
-			e.redraw()
-			e.setCursor()
-		case *tcell.EventKey:
-			switch ev.Key() {
-			case tcell.KeyEnter:
-				e.addLineAt(e.cursor)
-				e.moveCursor(right)
-			case tcell.KeyBackspace:
-				e.moveCursor(left)
-				whitespaceness := whitespacePattern.MatchString(string([]rune{e.runeAt(e.cursor)}))
-				e.deleteAt(e.cursor)
-				for e.moveCursor(left) {
-					if whitespaceness != whitespacePattern.MatchString(string([]rune{e.runeAt(e.cursor)})) {
-						e.moveCursor(right)
-						break
-					}
+			switch ev := untypedEv.(type) {
+			case *tcell.EventResize:
+				e.redraw()
+				e.setCursor()
+			case *tcell.EventKey:
+				switch ev.Key() {
+				case tcell.KeyEnter:
+					e.addLineAt(e.cursor)
+					e.moveCursor(right)
+				case tcell.KeyBackspace:
+					e.moveCursor(left)
+					whitespaceness := whitespacePattern.MatchString(string([]rune{e.runeAt(e.cursor)}))
 					e.deleteAt(e.cursor)
-				}
-			case tcell.KeyBackspace2:
-				removedSeg, removedRunes := e.removeSelection(false)
-				if len(removedRunes) == 0 {
-					if e.moveCursor(left) {
+					for e.moveCursor(left) {
+						if whitespaceness != whitespacePattern.MatchString(string([]rune{e.runeAt(e.cursor)})) {
+							e.moveCursor(right)
+							break
+						}
 						e.deleteAt(e.cursor)
 					}
-				} else {
-					e.backCursor(removedSeg, removedRunes)
-				}
-			case tcell.KeyDelete:
-				removedSeg, removedRunes := e.removeSelection(false)
-				if len(removedRunes) == 0 {
-					e.deleteAt(e.cursor)
-				} else {
-					e.backCursor(removedSeg, removedRunes)
-				}
-			case tcell.KeyTab:
-				e.writeAt([]rune{' '}, e.cursor)
-				e.moveCursor(right)
-				for e.cursor.x%4 != 0 {
+				case tcell.KeyBackspace2:
+					removedSeg, removedRunes := e.removeSelection(false)
+					if len(removedRunes) == 0 {
+						if e.moveCursor(left) {
+							e.deleteAt(e.cursor)
+						}
+					} else {
+						e.backCursor(removedSeg, removedRunes)
+					}
+				case tcell.KeyDelete:
+					removedSeg, removedRunes := e.removeSelection(false)
+					if len(removedRunes) == 0 {
+						e.deleteAt(e.cursor)
+					} else {
+						e.backCursor(removedSeg, removedRunes)
+					}
+				case tcell.KeyTab:
 					e.writeAt([]rune{' '}, e.cursor)
 					e.moveCursor(right)
-				}
-			case tcell.KeyRune:
-				e.writeAt([]rune(Escape(string([]rune{ev.Rune()}))), e.cursor)
-				e.moveCursor(right)
-			case tcell.KeyPgUp:
-				if ev.Modifiers()&tcell.ModShift != 0 {
-					selectFrom = e.cursor.clone()
-				}
-				_, height := e.Screen.Size()
-				for i := 0; i < height; i++ {
-					if !e.moveCursor(up) {
-						break
+					for e.cursor.x%4 != 0 {
+						e.writeAt([]rune{' '}, e.cursor)
+						e.moveCursor(right)
 					}
-				}
-			case tcell.KeyPgDn:
-				if ev.Modifiers()&tcell.ModShift != 0 {
-					selectFrom = e.cursor.clone()
-				}
-				_, height := e.Screen.Size()
-				for i := 0; i < height; i++ {
-					if !e.moveCursor(down) {
-						break
-					}
-				}
-			case tcell.KeyHome:
-				if ev.Modifiers()&tcell.ModShift != 0 {
-					selectFrom = e.cursor.clone()
-				}
-				e.cursor.x = 0
-				e.cursor.y = 0
-				e.lineOffset = 0
-				e.redraw()
-				e.setCursor()
-			case tcell.KeyEnd:
-				if ev.Modifiers()&tcell.ModShift != 0 {
-					selectFrom = e.cursor.clone()
-				}
-				_, height := e.Screen.Size()
-				e.lineOffset = e.maxInt(0, len(e.screenBuffer)-height/2)
-				e.cursor.y = len(e.screenBuffer) - e.lineOffset - 1
-				e.cursor.x = len(e.screenBuffer[e.cursor.y])
-				e.redraw()
-				e.setCursor()
-			case tcell.KeyCtrlZ:
-				storeUndo = false
-				clearRedo = false
-				if len(e.undoPatches) > 0 {
-					toApply := e.undoPatches[len(e.undoPatches)-1]
-					e.undoPatches = e.undoPatches[:len(e.undoPatches)-1]
-					newContent, applied := e.differ.PatchApply(toApply.patches, prevContent)
-					if applied[0] {
-						e.redoPatches = append(e.redoPatches, patch{patches: e.differ.PatchMake(newContent, prevContent), cursor: toApply.cursor})
-
-						e.rawBuffer = stringToRunes(newContent)
-						e.cursor = toApply.cursor
-
-						e.redraw()
-					}
-				}
-			case tcell.KeyCtrlY:
-				clearRedo = false
-				if len(e.redoPatches) > 0 {
-					toApply := e.redoPatches[len(e.redoPatches)-1]
-					e.redoPatches = e.redoPatches[:len(e.redoPatches)-1]
-					newContent, applied := e.differ.PatchApply(toApply.patches, prevContent)
-					if applied[0] {
-						e.rawBuffer = stringToRunes(newContent)
-						e.cursor = toApply.cursor
-						e.redraw()
-					}
-				}
-			case tcell.KeyCtrlC:
-				e.copySelection()
-			case tcell.KeyCtrlX:
-				e.removeSelection(true)
-				e.setCursor()
-			case tcell.KeyCtrlV:
-				if len(e.pasteBuffer) > 0 {
-					for idx, line := range e.pasteBuffer {
-						e.writeAt([]rune(Escape(string(line))), e.cursor)
-						for _ = range line {
-							e.moveCursor(right)
-						}
-						if idx+1 < len(e.pasteBuffer) {
-							e.addLineAt(e.cursor)
-							e.moveCursor(right)
-						}
-					}
-				}
-			case tcell.KeyCtrlW:
-				e.Screen.Fini()
-				return
-			case tcell.KeyUp:
-				if ev.Modifiers()&tcell.ModShift != 0 {
-					selectFrom = e.cursor.clone()
-				}
-				if ev.Modifiers()&tcell.ModCtrl != 0 {
-					e.moveCursorUntil(up, e.differentIndentness(e.cursor))
-				} else {
-					e.moveCursor(up)
-				}
-			case tcell.KeyDown:
-				if ev.Modifiers()&tcell.ModShift != 0 {
-					selectFrom = e.cursor.clone()
-				}
-				if ev.Modifiers()&tcell.ModCtrl != 0 {
-					e.moveCursorUntil(down, e.differentIndentness(e.cursor))
-				} else {
-					e.moveCursor(down)
-				}
-			case tcell.KeyLeft:
-				if ev.Modifiers()&tcell.ModShift != 0 {
-					selectFrom = e.cursor.clone()
-				}
-				if ev.Modifiers()&tcell.ModCtrl != 0 {
-					e.moveCursorUntil(left, e.differentWhitespaceness(e.cursor))
-				} else {
-					e.moveCursor(left)
-				}
-			case tcell.KeyRight:
-				if ev.Modifiers()&tcell.ModShift != 0 {
-					selectFrom = e.cursor.clone()
-				}
-				if ev.Modifiers()&tcell.ModCtrl != 0 {
-					e.moveCursorUntil(right, e.differentWhitespaceness(e.cursor))
-				} else {
+				case tcell.KeyRune:
+					e.writeAt([]rune(Escape(string([]rune{ev.Rune()}))), e.cursor)
 					e.moveCursor(right)
-				}
-			case tcell.KeyEsc:
-				e.selecting = false
-				selectFrom = nil
-				e.replace(true, selectToPattern, "", func(string, segment, segment) bool {
-					return true
-				})
-				e.replace(true, selectFromPattern, "", func(string, segment, segment) bool {
-					return true
-				})
-			}
-		}
-		if e.selecting {
-			if selectFrom == nil {
-				e.selecting = false
-			} else {
-				e.replace(true, selectToPattern, "", func(string, segment, segment) bool {
-					return true
-				})
-				e.writeAt([]rune(selectToToken), e.cursor)
-			}
-		} else {
-			if selectFrom != nil {
-				e.selecting = true
-				e.replace(true, selectToPattern, "", func(string, segment, segment) bool {
-					return true
-				})
-				e.replace(true, selectFromPattern, "", func(string, segment, segment) bool {
-					return true
-				})
-				ps := points{*selectFrom, e.cursor}
-				sort.Sort(ps)
-				for _, idx := range []int{1, 0} {
-					p := ps[idx]
-					if p == e.cursor {
-						e.writeAt([]rune(selectToToken), p)
+				case tcell.KeyPgUp:
+					if ev.Modifiers()&tcell.ModShift != 0 {
+						selectFrom = e.cursor.clone()
+					}
+					_, height := e.Screen.Size()
+					for i := 0; i < height; i++ {
+						if !e.moveCursor(up) {
+							break
+						}
+					}
+				case tcell.KeyPgDn:
+					if ev.Modifiers()&tcell.ModShift != 0 {
+						selectFrom = e.cursor.clone()
+					}
+					_, height := e.Screen.Size()
+					for i := 0; i < height; i++ {
+						if !e.moveCursor(down) {
+							break
+						}
+					}
+				case tcell.KeyHome:
+					if ev.Modifiers()&tcell.ModShift != 0 {
+						selectFrom = e.cursor.clone()
+					}
+					e.cursor.x = 0
+					e.cursor.y = 0
+					e.lineOffset = 0
+					e.redraw()
+					e.setCursor()
+				case tcell.KeyEnd:
+					if ev.Modifiers()&tcell.ModShift != 0 {
+						selectFrom = e.cursor.clone()
+					}
+					_, height := e.Screen.Size()
+					e.lineOffset = e.maxInt(0, len(e.screenBuffer)-height/2)
+					e.cursor.y = len(e.screenBuffer) - e.lineOffset - 1
+					e.cursor.x = len(e.screenBuffer[e.cursor.y])
+					e.redraw()
+					e.setCursor()
+				case tcell.KeyCtrlZ:
+					storeUndo = false
+					clearRedo = false
+					if len(e.undoPatches) > 0 {
+						toApply := e.undoPatches[len(e.undoPatches)-1]
+						e.undoPatches = e.undoPatches[:len(e.undoPatches)-1]
+						newContent, applied := e.differ.PatchApply(toApply.patches, prevContent)
+						if applied[0] {
+							e.redoPatches = append(e.redoPatches, patch{patches: e.differ.PatchMake(newContent, prevContent), cursor: toApply.cursor})
+
+							e.rawBuffer = stringToRunes(newContent)
+							e.cursor = toApply.cursor
+
+							e.redraw()
+						}
+					}
+				case tcell.KeyCtrlY:
+					clearRedo = false
+					if len(e.redoPatches) > 0 {
+						toApply := e.redoPatches[len(e.redoPatches)-1]
+						e.redoPatches = e.redoPatches[:len(e.redoPatches)-1]
+						newContent, applied := e.differ.PatchApply(toApply.patches, prevContent)
+						if applied[0] {
+							e.rawBuffer = stringToRunes(newContent)
+							e.cursor = toApply.cursor
+							e.redraw()
+						}
+					}
+				case tcell.KeyCtrlC:
+					e.copySelection()
+				case tcell.KeyCtrlX:
+					e.removeSelection(true)
+					e.setCursor()
+				case tcell.KeyCtrlV:
+					if len(e.pasteBuffer) > 0 {
+						for idx, line := range e.pasteBuffer {
+							e.writeAt([]rune(Escape(string(line))), e.cursor)
+							for _ = range line {
+								e.moveCursor(right)
+							}
+							if idx+1 < len(e.pasteBuffer) {
+								e.addLineAt(e.cursor)
+								e.moveCursor(right)
+							}
+						}
+					}
+				case tcell.KeyCtrlW:
+					e.Screen.Fini()
+					return
+				case tcell.KeyUp:
+					if ev.Modifiers()&tcell.ModShift != 0 {
+						selectFrom = e.cursor.clone()
+					}
+					if ev.Modifiers()&tcell.ModCtrl != 0 {
+						e.moveCursorUntil(up, e.differentIndentness(e.cursor))
 					} else {
-						e.writeAt([]rune(selectFromToken), p)
+						e.moveCursor(up)
+					}
+				case tcell.KeyDown:
+					if ev.Modifiers()&tcell.ModShift != 0 {
+						selectFrom = e.cursor.clone()
+					}
+					if ev.Modifiers()&tcell.ModCtrl != 0 {
+						e.moveCursorUntil(down, e.differentIndentness(e.cursor))
+					} else {
+						e.moveCursor(down)
+					}
+				case tcell.KeyLeft:
+					if ev.Modifiers()&tcell.ModShift != 0 {
+						selectFrom = e.cursor.clone()
+					}
+					if ev.Modifiers()&tcell.ModCtrl != 0 {
+						e.moveCursorUntil(left, e.differentWhitespaceness(e.cursor))
+					} else {
+						e.moveCursor(left)
+					}
+				case tcell.KeyRight:
+					if ev.Modifiers()&tcell.ModShift != 0 {
+						selectFrom = e.cursor.clone()
+					}
+					if ev.Modifiers()&tcell.ModCtrl != 0 {
+						e.moveCursorUntil(right, e.differentWhitespaceness(e.cursor))
+					} else {
+						e.moveCursor(right)
+					}
+				case tcell.KeyEsc:
+					e.selecting = false
+					selectFrom = nil
+					e.replace(true, selectToPattern, "", func(string, segment, segment) bool {
+						return true
+					})
+					e.replace(true, selectFromPattern, "", func(string, segment, segment) bool {
+						return true
+					})
+				}
+			}
+			if e.selecting {
+				if selectFrom == nil {
+					e.selecting = false
+				} else {
+					e.replace(true, selectToPattern, "", func(string, segment, segment) bool {
+						return true
+					})
+					e.writeAt([]rune(selectToToken), e.cursor)
+				}
+			} else {
+				if selectFrom != nil {
+					e.selecting = true
+					e.replace(true, selectToPattern, "", func(string, segment, segment) bool {
+						return true
+					})
+					e.replace(true, selectFromPattern, "", func(string, segment, segment) bool {
+						return true
+					})
+					ps := points{*selectFrom, e.cursor}
+					sort.Sort(ps)
+					for _, idx := range []int{1, 0} {
+						p := ps[idx]
+						if p == e.cursor {
+							e.writeAt([]rune(selectToToken), p)
+						} else {
+							e.writeAt([]rune(selectFromToken), p)
+						}
 					}
 				}
 			}
-		}
-		if storeUndo {
-			if newContent := runesToString(e.rawBuffer); newContent != prevContent {
-				e.undoPatches = append(e.undoPatches, patch{patches: e.differ.PatchMake(newContent, prevContent), cursor: prevCursor})
+			if storeUndo {
+				if newContent := runesToString(e.rawBuffer); newContent != prevContent {
+					e.undoPatches = append(e.undoPatches, patch{patches: e.differ.PatchMake(newContent, prevContent), cursor: prevCursor})
+				}
 			}
+			if clearRedo {
+				e.redoPatches = nil
+			}
+			e.Screen.ShowCursor(e.cursor.x, e.cursor.y)
+			e.Screen.Show()
 		}
-		if clearRedo {
-			e.redoPatches = nil
-		}
-		e.Screen.ShowCursor(e.cursor.x, e.cursor.y)
-		e.Screen.Show()
 	}
 }
 
@@ -1068,6 +1079,19 @@ func stringToRunes(s string) [][]rune {
 }
 
 func (e *Editor) setRaw(s string) {
+	e.rawBuffer = stringToRunes(s)
+}
+
+func (e *Editor) Content() string {
+	return runesToString(e.rawBuffer)
+}
+
+func (e *Editor) SetContent(s string) {
+	defer func() {
+		e.redraw()
+		e.setCursor()
+		e.Screen.Show()
+	}()
 	e.rawBuffer = stringToRunes(s)
 }
 
