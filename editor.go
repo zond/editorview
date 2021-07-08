@@ -33,15 +33,21 @@ type point struct {
 	y int
 }
 
-func (p point) dist(o point) float64 {
+func (p point) dist(o point) int {
 	dx := float64(p.x - o.x)
 	dy := float64(p.y - o.y)
-	return math.Sqrt(dx*dx + dy*dy)
+	return int(math.Round(math.Sqrt(dx*dx + dy*dy)))
 }
 
 func (p point) clone() *point {
 	cpy := p
 	return &cpy
+}
+
+type segment [2]point
+
+func (s segment) len() int {
+	return s[0].dist(s[1])
 }
 
 type points []point
@@ -72,14 +78,14 @@ type Editor struct {
 	Screen tcell.Screen
 
 	// Edited text: [line][rune]
-	contentBuffer [][]rune
+	rawBuffer [][]rune
 	// Line wrapped edited text: [line][rune]
-	wrappedBuffer [][]rune
-	// Index from [line][rune] of wrapped edited text to point{x: rune, y: line} of content buffer.
+	screenBuffer [][]rune
+	// Index from [line][rune] of wrapped edited text to point{x: rune, y: line} of raw buffer.
 	// Every line has a single point{x: -1, y: lineIdx} appended at the end to mark both cursor
 	// positions at the 'newline position' and lineIdx for empty lines.
-	wrappedBufferIndex [][]point
-	// number of wrappedBuffer lines hidden above screen
+	screenBufferIndex [][]point
+	// number of screenBuffer lines hidden above screen
 	lineOffset int
 
 	selecting   bool
@@ -91,10 +97,10 @@ type Editor struct {
 }
 
 func (e *Editor) runeAt(screenPoint point) rune {
-	wrappedPoint := point{x: screenPoint.x, y: screenPoint.y + e.lineOffset}
-	if wrappedPoint.y < len(e.wrappedBuffer) {
-		if wrappedPoint.x < len(e.wrappedBuffer[wrappedPoint.y]) {
-			return e.wrappedBuffer[wrappedPoint.y][wrappedPoint.x]
+	scrolledPoint := point{x: screenPoint.x, y: screenPoint.y + e.lineOffset}
+	if scrolledPoint.y < len(e.screenBuffer) {
+		if scrolledPoint.x < len(e.screenBuffer[scrolledPoint.y]) {
+			return e.screenBuffer[scrolledPoint.y][scrolledPoint.x]
 		}
 		return '\n'
 	}
@@ -109,8 +115,8 @@ func (e *Editor) differentWhitespaceness(screenPoint point) func(screenPoint poi
 }
 
 func (e *Editor) indentation(screenY int) int {
-	p := e.wrappedBufferIndex[screenY+e.lineOffset][0]
-	for x, r := range e.contentBuffer[p.y] {
+	p := e.screenBufferIndex[screenY+e.lineOffset][0]
+	for x, r := range e.rawBuffer[p.y] {
 		if whitespacePattern.MatchString(string([]rune{r})) {
 			return x
 		}
@@ -138,63 +144,55 @@ func (e *Editor) moveCursorUntil(dir direction, cont func(screenPoint point) boo
 }
 
 func (e *Editor) addLineAt(screenPoint point) {
-	defer func() {
-		e.redraw()
-	}()
-	p := e.wrappedBufferIndex[screenPoint.y+e.lineOffset][screenPoint.x]
+	defer e.redraw()
+	p := e.screenBufferIndex[screenPoint.y+e.lineOffset][screenPoint.x]
 	if p.x < 0 {
-		e.contentBuffer = append(
-			e.contentBuffer[:p.y+1],
-			append(
-				[][]rune{nil},
-				e.contentBuffer[p.y+1:]...)...)
+		e.rawBuffer = concatRuneLines(
+			e.rawBuffer[:p.y+1],
+			[][]rune{nil},
+			e.rawBuffer[p.y+1:],
+		)
 		return
 	}
-	e.contentBuffer = append(
-		e.contentBuffer[:p.y],
-		append(
-			[][]rune{e.contentBuffer[p.y][:p.x]},
-			append(
-				[][]rune{e.contentBuffer[p.y][p.x:]},
-				e.contentBuffer[p.y+1:]...)...)...)
-}
-
-func (e *Editor) deleteFromContentBuffer(p point) {
-	defer func() {
-		e.redraw()
-	}()
-	if p.x < 0 {
-		if p.y+1 < len(e.contentBuffer) {
-			e.contentBuffer = append(
-				e.contentBuffer[:p.y],
-				append(
-					[][]rune{append(e.contentBuffer[p.y], e.contentBuffer[p.y+1]...)},
-					e.contentBuffer[p.y+2:]...)...)
-		}
-		return
-	}
-	if e.contentBuffer[p.y][p.x] == '&' {
-		if len(e.contentBuffer[p.y])-p.x > 5 && string(e.contentBuffer[p.y][p.x:p.x+5]) == "&amp;" {
-			e.contentBuffer[p.y] = append(e.contentBuffer[p.y][:p.x], e.contentBuffer[p.y][p.x+5:]...)
-			return
-		} else if len(e.contentBuffer[p.y])-p.x > 4 && string(e.contentBuffer[p.y][p.x:p.x+4]) == "&gt;" {
-			e.contentBuffer[p.y] = append(e.contentBuffer[p.y][:p.x], e.contentBuffer[p.y][p.x+4:]...)
-			return
-		} else if len(e.contentBuffer[p.y])-p.x > 4 && string(e.contentBuffer[p.y][p.x:p.x+4]) == "&lt;" {
-			e.contentBuffer[p.y] = append(e.contentBuffer[p.y][:p.x], e.contentBuffer[p.y][p.x+4:]...)
-			return
-		}
-	}
-	e.contentBuffer[p.y] = append(e.contentBuffer[p.y][:p.x], e.contentBuffer[p.y][p.x+1:]...)
+	e.rawBuffer = concatRuneLines(
+		e.rawBuffer[:p.y],
+		[][]rune{e.rawBuffer[p.y][:p.x]},
+		[][]rune{e.rawBuffer[p.y][p.x:]},
+		e.rawBuffer[p.y+1:],
+	)
 }
 
 func (e *Editor) deleteAt(screenPoint point) {
-	e.deleteFromContentBuffer(e.wrappedBufferIndex[screenPoint.y+e.lineOffset][screenPoint.x])
+	defer e.redraw()
+	p := e.screenBufferIndex[screenPoint.y+e.lineOffset][screenPoint.x]
+	if p.x < 0 {
+		if p.y+1 < len(e.rawBuffer) {
+			e.rawBuffer = concatRuneLines(
+				e.rawBuffer[:p.y],
+				[][]rune{concatRunes(e.rawBuffer[p.y], e.rawBuffer[p.y+1])},
+				e.rawBuffer[p.y+2:],
+			)
+		}
+		return
+	}
+	if e.rawBuffer[p.y][p.x] == '&' {
+		if len(e.rawBuffer[p.y])-p.x > 5 && string(e.rawBuffer[p.y][p.x:p.x+5]) == "&amp;" {
+			e.rawBuffer[p.y] = concatRunes(e.rawBuffer[p.y][:p.x], e.rawBuffer[p.y][p.x+5:])
+			return
+		} else if len(e.rawBuffer[p.y])-p.x > 4 && string(e.rawBuffer[p.y][p.x:p.x+4]) == "&gt;" {
+			e.rawBuffer[p.y] = concatRunes(e.rawBuffer[p.y][:p.x], e.rawBuffer[p.y][p.x+4:])
+			return
+		} else if len(e.rawBuffer[p.y])-p.x > 4 && string(e.rawBuffer[p.y][p.x:p.x+4]) == "&lt;" {
+			e.rawBuffer[p.y] = concatRunes(e.rawBuffer[p.y][:p.x], e.rawBuffer[p.y][p.x+4:])
+			return
+		}
+	}
+	e.rawBuffer[p.y] = concatRunes(e.rawBuffer[p.y][:p.x], e.rawBuffer[p.y][p.x+1:])
 }
 
 func (e *Editor) plain(r [][]rune) [][]rune {
 	res := [][]rune{}
-	e.parseTokens(r, func(t *token) {
+	parseTokens(r, func(t *token) {
 		if t.start {
 			res = append(res, nil)
 		} else if t.rune != nil {
@@ -206,85 +204,154 @@ func (e *Editor) plain(r [][]rune) [][]rune {
 	return res
 }
 
-func (e *Editor) replace(p *regexp.Regexp, repl string, query func(match string, contentBufferStart, contentBufferEnd point) bool) {
-	content := []rune{}
-	contentIndex := points{}
-	contentOffset := 0
-	x := 0
-	y := 0
-	line := []rune{}
-	r := rune(0)
-	for y, line = range e.contentBuffer {
-		for x, r = range line {
-			contentIndex = append(contentIndex, point{x: x, y: y})
-			content = append(content, r)
+type flatIndex struct {
+	raw     point
+	screen  point
+	flatRaw int
+}
+
+func flattenWithIndex(rs [][]rune) (flatRaw, flatScreen []rune, rawIndex, screenIndex []flatIndex) {
+	screenPos := point{}
+	parseTokens(rs, func(t *token) {
+		if t.rune != nil {
+			rawPos := t.pos
+			offset := 0
+			for _ = range t.buffer {
+				rawIndex = append(rawIndex, flatIndex{raw: rawPos, screen: screenPos, flatRaw: len(flatRaw) + offset})
+				rawPos.x++
+				offset++
+			}
+
+			screenIndex = append(screenIndex, flatIndex{raw: t.pos, screen: screenPos, flatRaw: len(flatRaw)})
+			screenPos.x++
+
+			flatRaw = concatRunes(flatRaw, t.buffer)
+			flatScreen = append(flatScreen, *t.rune)
+		} else if t.newLine {
+			rawIndex = append(rawIndex, flatIndex{raw: t.pos, screen: screenPos, flatRaw: len(flatRaw)})
+
+			screenIndex = append(screenIndex, flatIndex{raw: t.pos, screen: screenPos, flatRaw: len(flatRaw)})
+			screenPos.y++
+			screenPos.x = 0
+
+			flatRaw = append(flatRaw, '\n')
+			flatScreen = append(flatScreen, '\n')
+		} else if t.eof {
+			rawIndex = append(rawIndex, flatIndex{raw: t.pos, screen: screenPos, flatRaw: len(flatRaw)})
+			screenIndex = append(screenIndex, flatIndex{raw: t.pos, screen: screenPos, flatRaw: len(flatRaw)})
+		} else {
+			pos := t.pos
+			offset := 0
+			for _ = range t.buffer {
+				rawIndex = append(rawIndex, flatIndex{raw: pos, screen: screenPos, flatRaw: len(flatRaw) + offset})
+				pos.x++
+				offset++
+			}
+
+			flatRaw = concatRunes(flatRaw, t.buffer)
 		}
-		if y+1 < len(e.contentBuffer) {
-			contentIndex = append(contentIndex, point{x: x + 1, y: y})
-			content = append(content, '\n')
+	})
+	return flatRaw, flatScreen, rawIndex, screenIndex
+}
+
+func (e *Editor) replace(raw bool, p *regexp.Regexp, repl string, query func(match string, rawSeg, screenSeg segment) bool) {
+	changedAnything := false
+	e.rawBuffer = replace(e.rawBuffer, raw, p, repl, func(match string, rawSeg, screenSeg segment) bool {
+		res := query(match, rawSeg, screenSeg)
+		if res {
+			changedAnything = true
 		}
+		return res
+	})
+	if changedAnything {
+		e.redraw()
 	}
-	lastPoint := contentIndex[len(contentIndex)-1]
-	contentIndex = append(contentIndex, point{x: lastPoint.x + 1, y: lastPoint.y})
+}
+
+func replace(rs [][]rune, raw bool, p *regexp.Regexp, repl string, query func(match string, rawSeg, screenSeg segment) bool) [][]rune {
+	flatRaw, flatScreen, rawIndex, screenIndex := flattenWithIndex(rs)
+
+	resRunes := make([]rune, len(flatRaw))
+	copy(resRunes, flatRaw)
+
+	haystack := flatScreen
+	haystackIndex := screenIndex
+	if raw {
+		haystack = flatRaw
+		haystackIndex = rawIndex
+	}
+
+	haystackOffset := 0
 	for {
-		processedContent := content[contentOffset:]
-		processedContentIndex := contentIndex[contentOffset:]
-		matchIndex := p.FindStringIndex(string(processedContent))
+		remainingHaystack := haystack[haystackOffset:]
+		remainingHaystackIndex := haystackIndex[haystackOffset:]
+
+		searchString := string(remainingHaystack)
+		matchIndex := p.FindStringIndex(searchString)
 		if matchIndex == nil {
-			return
+			return stringToRunes(string(resRunes))
 		}
-		contentStartIndex, contentEndIndex := processedContentIndex[matchIndex[0]], processedContentIndex[matchIndex[1]]
-		if query(string(processedContent)[matchIndex[0]:matchIndex[1]], contentStartIndex, contentEndIndex) {
-			replacement := p.ReplaceAllString(string(processedContent)[matchIndex[0]:matchIndex[1]], repl)
-			content = append(
-				content[:contentOffset],
-				append(
-					processedContent[:matchIndex[0]],
-					append(
-						[]rune(replacement),
-						processedContent[matchIndex[1]:]...)...)...)
-			e.contentBuffer = e.stringToRunes(string(content))
-			e.redraw()
+
+		startIndex := remainingHaystackIndex[len([]rune(searchString[:matchIndex[0]]))]
+		endIndex := remainingHaystackIndex[len([]rune(searchString[:matchIndex[1]]))]
+
+		if query(searchString[matchIndex[0]:matchIndex[1]], segment{startIndex.raw, endIndex.raw}, segment{startIndex.screen, endIndex.screen}) {
+			replacement := p.ReplaceAllString(searchString[matchIndex[0]:matchIndex[1]], repl)
+			resRunes = concatRunes(resRunes[:startIndex.flatRaw], []rune(replacement), []rune(searchString[matchIndex[1]:]))
 		}
-		contentOffset += matchIndex[1]
-		if contentOffset > len(content)-1 {
-			return
+		haystackOffset += len([]rune(searchString[:matchIndex[1]]))
+		if haystackOffset > len(haystack)-1 {
+			return stringToRunes(string(resRunes))
 		}
 	}
+}
+
+func concatRuneLines(rs ...[][]rune) [][]rune {
+	res := [][]rune{}
+	for _, r := range rs {
+		res = append(res, r...)
+	}
+	return res
+}
+
+func concatRunes(rs ...[]rune) []rune {
+	res := []rune{}
+	for _, r := range rs {
+		res = append(res, r...)
+	}
+	return res
 }
 
 func (e *Editor) writeAt(runes []rune, screenPoint point) {
-	defer func() {
-		e.redraw()
-	}()
-	p := e.wrappedBufferIndex[screenPoint.y+e.lineOffset][screenPoint.x]
+	defer e.redraw()
+	p := e.screenBufferIndex[screenPoint.y+e.lineOffset][screenPoint.x]
 	if p.x < 0 {
-		e.contentBuffer[p.y] = append(e.contentBuffer[p.y], runes...)
+		e.rawBuffer[p.y] = concatRunes(e.rawBuffer[p.y], runes)
 		return
 	}
-	e.contentBuffer[p.y] = append(
-		e.contentBuffer[p.y][:p.x],
-		append(
-			runes,
-			e.contentBuffer[p.y][p.x:]...)...)
+	e.rawBuffer[p.y] = concatRunes(
+		e.rawBuffer[p.y][:p.x],
+		runes,
+		e.rawBuffer[p.y][p.x:],
+	)
 }
 
 func (e *Editor) debuglog() {
-	for _, l := range e.contentBuffer {
+	for _, l := range e.rawBuffer {
 		log.Printf("%q", string(l))
 	}
 }
 
 func (e *Editor) copySelection() {
-	e.replace(selectionPattern, "", func(s string, f point, t point) bool {
+	e.replace(true, selectionPattern, "", func(s string, rawSeg, screenSeg segment) bool {
 		if match := selectionPattern.FindStringSubmatch(s); match != nil {
-			e.pasteBuffer = e.plain(e.stringToRunes(match[2]))
+			e.pasteBuffer = e.plain(stringToRunes(match[2]))
 		}
 		return false
 	})
 }
 
-func (e *Editor) runesToString(rs [][]rune) string {
+func runesToString(rs [][]rune) string {
 	res := &bytes.Buffer{}
 	for idx, line := range rs {
 		fmt.Fprintf(res, "%v", string(line))
@@ -295,25 +362,42 @@ func (e *Editor) runesToString(rs [][]rune) string {
 	return res.String()
 }
 
-func (e *Editor) removeSelection(cpy bool) (from, to *point, removedRunes int) {
-	e.replace(selectionPattern, "", func(s string, f point, t point) bool {
+func (e *Editor) removeSelection(cpy bool) (removedScreenSeg segment, removedRunes []rune) {
+	e.replace(true, selectionPattern, "", func(s string, rawSeg, screenSeg segment) bool {
 		if cpy {
 			if match := selectionPattern.FindStringSubmatch(s); match != nil {
-				e.pasteBuffer = e.plain(e.stringToRunes(match[2]))
+				e.pasteBuffer = e.plain(stringToRunes(match[2]))
 			}
 		}
-		removedRunes = len([]rune(e.runesToString(e.plain(e.stringToRunes(s)))))
-		from = &f
-		to = &t
+		removedScreenSeg = screenSeg
+		removedRunes = []rune(runesToString(e.plain(stringToRunes(s))))
 		return true
 	})
-	return from, to, removedRunes
+	return
+}
+
+func (e *Editor) backCursor(removedSeg segment, removedRunes []rune) {
+	ps := points{removedSeg[0], removedSeg[1], e.cursor}
+	sort.Sort(ps)
+	if ps[1] == e.cursor || (ps[2] == e.cursor && ps[1].dist(ps[2]) == 1) {
+		e.cursor = removedSeg[0]
+	} else if ps[2] == e.cursor && e.cursor.y == ps[1].y {
+		for i := 0; i < len(removedRunes); i++ {
+			e.cursor.x--
+		}
+	} else if ps[2] == e.cursor {
+		lines := strings.Count(string(removedRunes), "\n")
+		for i := 0; i < lines; i++ {
+			e.cursor.y--
+		}
+	}
+	e.setCursor()
 }
 
 func (e *Editor) pollKeys() {
 	var selectFrom *point
 	for {
-		prevContent := e.runesToString(e.contentBuffer)
+		prevContent := runesToString(e.rawBuffer)
 		prevCursor := e.cursor
 		storeUndo := true
 		clearRedo := true
@@ -340,22 +424,20 @@ func (e *Editor) pollKeys() {
 					e.deleteAt(e.cursor)
 				}
 			case tcell.KeyBackspace2:
-				from, to, removed := e.removeSelection(false)
-				if from == nil || to == nil || removed == 0 {
+				removedSeg, removedRunes := e.removeSelection(false)
+				if len(removedRunes) == 0 {
 					if e.moveCursor(left) {
 						e.deleteAt(e.cursor)
 					}
 				} else {
-					// TODO(zond): Make the cursor end up in a logical place.
-					e.setCursor()
+					e.backCursor(removedSeg, removedRunes)
 				}
 			case tcell.KeyDelete:
-				from, to, removed := e.removeSelection(false)
-				if from == nil || to == nil || removed == 0 {
+				removedSeg, removedRunes := e.removeSelection(false)
+				if len(removedRunes) == 0 {
 					e.deleteAt(e.cursor)
 				} else {
-					// TODO(zond): Make the cursor end up in a logical place.
-					e.setCursor()
+					e.backCursor(removedSeg, removedRunes)
 				}
 			case tcell.KeyTab:
 				e.writeAt([]rune{' '}, e.cursor)
@@ -401,9 +483,9 @@ func (e *Editor) pollKeys() {
 					selectFrom = e.cursor.clone()
 				}
 				_, height := e.Screen.Size()
-				e.lineOffset = len(e.wrappedBuffer) - height/2
-				e.cursor.y = len(e.wrappedBuffer) - e.lineOffset - 1
-				e.cursor.x = len(e.wrappedBuffer[e.cursor.y])
+				e.lineOffset = e.maxInt(0, len(e.screenBuffer)-height/2)
+				e.cursor.y = len(e.screenBuffer) - e.lineOffset - 1
+				e.cursor.x = len(e.screenBuffer[e.cursor.y])
 				e.redraw()
 				e.setCursor()
 			case tcell.KeyCtrlZ:
@@ -416,7 +498,7 @@ func (e *Editor) pollKeys() {
 					if applied[0] {
 						e.redoPatches = append(e.redoPatches, patch{patches: e.differ.PatchMake(newContent, prevContent), cursor: toApply.cursor})
 
-						e.contentBuffer = e.stringToRunes(newContent)
+						e.rawBuffer = stringToRunes(newContent)
 						e.cursor = toApply.cursor
 
 						e.redraw()
@@ -429,7 +511,7 @@ func (e *Editor) pollKeys() {
 					e.redoPatches = e.redoPatches[:len(e.redoPatches)-1]
 					newContent, applied := e.differ.PatchApply(toApply.patches, prevContent)
 					if applied[0] {
-						e.contentBuffer = e.stringToRunes(newContent)
+						e.rawBuffer = stringToRunes(newContent)
 						e.cursor = toApply.cursor
 						e.redraw()
 					}
@@ -494,10 +576,10 @@ func (e *Editor) pollKeys() {
 			case tcell.KeyEsc:
 				e.selecting = false
 				selectFrom = nil
-				e.replace(selectToPattern, "", func(string, point, point) bool {
+				e.replace(true, selectToPattern, "", func(string, segment, segment) bool {
 					return true
 				})
-				e.replace(selectFromPattern, "", func(string, point, point) bool {
+				e.replace(true, selectFromPattern, "", func(string, segment, segment) bool {
 					return true
 				})
 			}
@@ -506,7 +588,7 @@ func (e *Editor) pollKeys() {
 			if selectFrom == nil {
 				e.selecting = false
 			} else {
-				e.replace(selectToPattern, "", func(string, point, point) bool {
+				e.replace(true, selectToPattern, "", func(string, segment, segment) bool {
 					return true
 				})
 				e.writeAt([]rune(selectToToken), e.cursor)
@@ -514,10 +596,10 @@ func (e *Editor) pollKeys() {
 		} else {
 			if selectFrom != nil {
 				e.selecting = true
-				e.replace(selectToPattern, "", func(string, point, point) bool {
+				e.replace(true, selectToPattern, "", func(string, segment, segment) bool {
 					return true
 				})
-				e.replace(selectFromPattern, "", func(string, point, point) bool {
+				e.replace(true, selectFromPattern, "", func(string, segment, segment) bool {
 					return true
 				})
 				ps := points{*selectFrom, e.cursor}
@@ -533,7 +615,7 @@ func (e *Editor) pollKeys() {
 			}
 		}
 		if storeUndo {
-			if newContent := e.runesToString(e.contentBuffer); newContent != prevContent {
+			if newContent := runesToString(e.rawBuffer); newContent != prevContent {
 				e.undoPatches = append(e.undoPatches, patch{patches: e.differ.PatchMake(newContent, prevContent), cursor: prevCursor})
 			}
 		}
@@ -574,7 +656,7 @@ func (e *Editor) canScroll(d direction) bool {
 		return e.lineOffset > 0
 	case down:
 		_, height := e.Screen.Size()
-		return e.lineOffset+1 < len(e.wrappedBuffer)-height/2
+		return e.lineOffset+1 < len(e.screenBuffer)-height/2
 	}
 	return false
 }
@@ -590,14 +672,12 @@ func (e *Editor) scroll(d direction) {
 	case down:
 		e.lineOffset++
 	}
-	e.limitInt(&e.lineOffset, 0, len(e.wrappedBuffer)-height/2)
+	e.limitInt(&e.lineOffset, 0, len(e.screenBuffer)-height/2)
 	e.redraw()
 }
 
 func (e *Editor) moveCursor(d direction) bool {
-	defer func() {
-		e.setCursor()
-	}()
+	defer e.setCursor()
 	switch d {
 	case up:
 		if e.canMoveCursor(up) {
@@ -613,11 +693,11 @@ func (e *Editor) moveCursor(d direction) bool {
 			return true
 		} else if e.canMoveCursor(up) {
 			e.cursor.y--
-			e.cursor.x = len(e.wrappedBuffer[e.cursor.y+e.lineOffset])
+			e.cursor.x = len(e.screenBuffer[e.cursor.y+e.lineOffset])
 			return true
 		} else if e.canScroll(up) {
 			e.scroll(up)
-			e.cursor.x = len(e.wrappedBuffer[e.cursor.y+e.lineOffset])
+			e.cursor.x = len(e.screenBuffer[e.cursor.y+e.lineOffset])
 			return e.moveCursor(left)
 		}
 	case down:
@@ -636,7 +716,7 @@ func (e *Editor) moveCursor(d direction) bool {
 			e.cursor.y++
 			e.cursor.x = 0
 			return true
-		} else if e.cursor.y+e.lineOffset+1 < len(e.wrappedBuffer) && e.canScroll(down) {
+		} else if e.cursor.y+e.lineOffset+1 < len(e.screenBuffer) && e.canScroll(down) {
 			e.scroll(down)
 			e.cursor.x = 0
 			return true
@@ -675,8 +755,8 @@ func (e *Editor) maxInt(i ...int) int {
 }
 
 func (e *Editor) lineWidth(y int) int {
-	if y+e.lineOffset < len(e.wrappedBuffer) {
-		return len(e.wrappedBuffer[y+e.lineOffset])
+	if y+e.lineOffset < len(e.screenBuffer) {
+		return len(e.screenBuffer[y+e.lineOffset])
 	}
 	return 0
 }
@@ -686,7 +766,7 @@ func (e *Editor) setCursor() {
 	if width == 0 || height == 0 {
 		return
 	}
-	e.limitInt(&e.cursor.y, 0, e.minInt(height, len(e.wrappedBuffer)-e.lineOffset))
+	e.limitInt(&e.cursor.y, 0, e.minInt(height, len(e.screenBuffer)-e.lineOffset))
 	e.limitInt(&e.cursor.x, 0, e.minInt(width, e.lineWidth(e.cursor.y)+1))
 }
 
@@ -698,7 +778,7 @@ func (e *Editor) canMoveCursor(d direction) bool {
 	case left:
 		return e.cursor.x > 0
 	case down:
-		return e.cursor.y+1 < height && e.cursor.y+e.lineOffset < len(e.wrappedBuffer)-1
+		return e.cursor.y+1 < height && e.cursor.y+e.lineOffset < len(e.screenBuffer)-1
 	case right:
 		return e.cursor.x+1 < width && e.cursor.x < e.lineWidth(e.cursor.y)
 	}
@@ -706,6 +786,7 @@ func (e *Editor) canMoveCursor(d direction) bool {
 }
 
 type token struct {
+	buffer      []rune
 	pos         point
 	rune        *rune
 	style       *tcell.Style
@@ -716,8 +797,51 @@ type token struct {
 	selectEnd   bool
 }
 
+func (t *token) eq(o *token) (bool, error) {
+	if string(t.buffer) != string(o.buffer) {
+		return false, fmt.Errorf("buffer %q != %q", string(t.buffer), string(o.buffer))
+	}
+	if t.pos != o.pos {
+		return false, fmt.Errorf("pos %+v != %+v", t.pos, o.pos)
+	}
+	if t.rune != nil && o.rune != nil && *t.rune != *o.rune {
+		return false, fmt.Errorf("rune %q != %q", string([]rune{*t.rune}), string([]rune{*o.rune}))
+	}
+	if t.rune != nil && o.rune == nil {
+		return false, fmt.Errorf("rune %q != nil", string([]rune{*t.rune}))
+	}
+	if t.rune == nil && o.rune != nil {
+		return false, fmt.Errorf("rune nil != %q", string([]rune{*o.rune}))
+	}
+	if t.style != nil && o.style != nil && *t.style != *o.style {
+		return false, fmt.Errorf("style %+v != %+v", *t.style, *o.style)
+	}
+	if t.style != nil && o.style == nil {
+		return false, fmt.Errorf("style %+v != nil", *t.style)
+	}
+	if t.style == nil && o.style != nil {
+		return false, fmt.Errorf("style nil != %+v", *o.style)
+	}
+	if t.newLine != o.newLine {
+		return false, fmt.Errorf("newLine %v != %v", t.newLine, o.newLine)
+	}
+	if t.eof != o.eof {
+		return false, fmt.Errorf("eof %v != %v", t.eof, o.eof)
+	}
+	if t.start != o.start {
+		return false, fmt.Errorf("start %v != %v", t.start, o.start)
+	}
+	if t.selectStart != o.selectStart {
+		return false, fmt.Errorf("selectStart %v != %v", t.selectStart, o.selectStart)
+	}
+	if t.selectEnd != o.selectEnd {
+		return false, fmt.Errorf("selectEnd %v != %v", t.selectEnd, o.selectEnd)
+	}
+	return true, nil
+}
+
 func (t *token) reset() {
-	*t = token{pos: t.pos}
+	*t = token{pos: t.pos, buffer: t.buffer}
 }
 
 func (t *token) setSelectStart() *token {
@@ -782,92 +906,88 @@ func (p parseState) String() string {
 	return "unknown"
 }
 
-func (e *Editor) parseTokens(buffer [][]rune, cb func(*token)) {
+func parseTokens(buffer [][]rune, rawCB func(*token)) {
 	state := visible
-	stateBuffer := []rune{}
 
 	inSelection := false
 
-	token := token{}
+	t := &token{}
 	line := []rune{}
 	tmpX := 0
 	r := rune(0)
+	cb := func(t *token) {
+		rawCB(t)
+		t.buffer = nil
+	}
 
-	cb(token.setStart())
-	for token.pos.y, line = range buffer {
+	cb(t.setStart())
+	for t.pos.y, line = range buffer {
 		for tmpX, r = range line {
+			t.buffer = append(t.buffer, r)
 			switch state {
 			case visible:
-				token.pos.x = tmpX
+				t.pos.x = tmpX
 				switch r {
 				case '&':
-					stateBuffer = []rune{r}
 					state = escape
 				case '<':
-					stateBuffer = []rune{r}
 					state = tag
 				default:
-					cb(token.setRune(r))
+					cb(t.setRune(r))
 				}
 			case escape:
 				switch r {
 				case ';':
-					stateBuffer = append(stateBuffer, r)
-					switch string(stateBuffer) {
+					switch string(t.buffer) {
 					case "&amp;":
-						cb(token.setRune('&'))
+						cb(t.setRune('&'))
 						state = visible
 					case "&lt;":
-						cb(token.setRune('<'))
+						cb(t.setRune('<'))
 						state = visible
 					case "&gt;":
-						cb(token.setRune('>'))
+						cb(t.setRune('>'))
 						state = visible
 					}
 					state = visible
-				default:
-					stateBuffer = append(stateBuffer, r)
 				}
 			case tag:
 				switch r {
 				case '>':
-					stateBuffer = append(stateBuffer, r)
-					switch string(stateBuffer) {
+					switch string(t.buffer) {
 					case selectFromToken, selectToToken:
 						if inSelection {
-							cb(token.setSelectEnd())
+							cb(t.setSelectEnd())
 						} else {
-							cb(token.setSelectStart())
+							cb(t.setSelectStart())
 						}
 						inSelection = !inSelection
 					default:
-						if match := colorTagPattern.FindStringSubmatch(string(stateBuffer)); match != nil {
+						if match := colorTagPattern.FindStringSubmatch(string(t.buffer)); match != nil {
 							fgUint, fgErr := strconv.ParseUint(match[1], 16, 64)
 							bgUint, bgErr := strconv.ParseUint(match[2], 16, 64)
 							if fgErr == nil && bgErr == nil {
-								cb(token.setStyle(tcell.StyleDefault.Foreground(tcell.NewHexColor(int32(fgUint))).Background(tcell.NewHexColor(int32(bgUint)))))
+								cb(t.setStyle(tcell.StyleDefault.Foreground(tcell.NewHexColor(int32(fgUint))).Background(tcell.NewHexColor(int32(bgUint)))))
 							}
 						}
 					}
 					state = visible
-				default:
-					stateBuffer = append(stateBuffer, r)
 				}
 			}
 		}
-		if token.pos.y+1 < len(buffer) {
-			token.pos.x++
-			cb(token.setNewLine())
+		if t.pos.y+1 < len(buffer) {
+			t.pos.x = tmpX + 1
+			cb(t.setNewLine())
 			state = visible
 		}
 	}
-	token.pos.x++
-	cb(token.setEof())
+	t.pos.x = tmpX + 1
+	cb(t.setEof())
 }
 
 func (e *Editor) redraw() {
-	e.wrappedBuffer = nil
-	e.wrappedBufferIndex = nil
+	e.screenBuffer = nil
+	e.screenBufferIndex = nil
 
 	// No screen makes it impossible to index.
 	width, height := e.Screen.Size()
@@ -881,31 +1001,31 @@ func (e *Editor) redraw() {
 	styleIndex := [][]tcell.Style{}
 
 	beginLine := func() {
-		e.wrappedBuffer = append(e.wrappedBuffer, nil)
-		e.wrappedBufferIndex = append(e.wrappedBufferIndex, nil)
+		e.screenBuffer = append(e.screenBuffer, nil)
+		e.screenBufferIndex = append(e.screenBufferIndex, nil)
 		styleIndex = append(styleIndex, nil)
 	}
-	endLine := func(contentLineIdx int) {
-		e.wrappedBufferIndex[len(e.wrappedBufferIndex)-1] = append(
-			e.wrappedBufferIndex[len(e.wrappedBufferIndex)-1],
+	endLine := func(rawLineIdx int) {
+		e.screenBufferIndex[len(e.screenBufferIndex)-1] = append(
+			e.screenBufferIndex[len(e.screenBufferIndex)-1],
 			point{
 				x: -1,
-				y: contentLineIdx,
+				y: rawLineIdx,
 			},
 		)
 	}
 
-	e.parseTokens(e.contentBuffer, func(t *token) {
+	parseTokens(e.rawBuffer, func(t *token) {
 		if t.start {
 			beginLine()
 		} else if t.newLine {
 			endLine(t.pos.y)
 			beginLine()
 		} else if t.rune != nil {
-			e.wrappedBuffer[len(e.wrappedBuffer)-1] = append(e.wrappedBuffer[len(e.wrappedBuffer)-1], *t.rune)
-			e.wrappedBufferIndex[len(e.wrappedBufferIndex)-1] = append(e.wrappedBufferIndex[len(e.wrappedBufferIndex)-1], t.pos)
+			e.screenBuffer[len(e.screenBuffer)-1] = append(e.screenBuffer[len(e.screenBuffer)-1], *t.rune)
+			e.screenBufferIndex[len(e.screenBufferIndex)-1] = append(e.screenBufferIndex[len(e.screenBufferIndex)-1], t.pos)
 			styleIndex[len(styleIndex)-1] = append(styleIndex[len(styleIndex)-1], style)
-			if len(e.wrappedBuffer[len(e.wrappedBuffer)-1]) > width-1 {
+			if len(e.screenBuffer[len(e.screenBuffer)-1]) > width-1 {
 				endLine(t.pos.y)
 				beginLine()
 			}
@@ -921,25 +1041,25 @@ func (e *Editor) redraw() {
 		}
 	})
 
-	for wrappedLineIdx, wrappedLine := range e.wrappedBuffer[e.lineOffset:] {
-		for wrappedRuneIdx, wrappedRune := range wrappedLine {
-			e.Screen.SetContent(wrappedRuneIdx, wrappedLineIdx, wrappedRune, nil, styleIndex[wrappedLineIdx+e.lineOffset][wrappedRuneIdx])
+	for screenLineIdx, screenLine := range e.screenBuffer[e.lineOffset:] {
+		for screenRuneIdx, screenRune := range screenLine {
+			e.Screen.SetContent(screenRuneIdx, screenLineIdx, screenRune, nil, styleIndex[screenLineIdx+e.lineOffset][screenRuneIdx])
 		}
-		for x := len(wrappedLine); x < width; x++ {
-			e.Screen.SetContent(x, wrappedLineIdx, ' ', nil, tcell.StyleDefault)
+		for x := len(screenLine); x < width; x++ {
+			e.Screen.SetContent(x, screenLineIdx, ' ', nil, tcell.StyleDefault)
 		}
-		if wrappedLineIdx+1 > height-1 {
+		if screenLineIdx+1 > height-1 {
 			break
 		}
 	}
-	for y := len(e.wrappedBuffer) - e.lineOffset; y < height; y++ {
+	for y := len(e.screenBuffer) - e.lineOffset; y < height; y++ {
 		for x := 0; x < width; x++ {
 			e.Screen.SetContent(x, y, ' ', nil, tcell.StyleDefault)
 		}
 	}
 }
 
-func (e *Editor) stringToRunes(s string) [][]rune {
+func stringToRunes(s string) [][]rune {
 	res := [][]rune{}
 	for _, line := range strings.Split(s, "\n") {
 		res = append(res, []rune(line))
@@ -947,13 +1067,13 @@ func (e *Editor) stringToRunes(s string) [][]rune {
 	return res
 }
 
-func (e *Editor) setContent(s string) {
-	e.contentBuffer = e.stringToRunes(s)
+func (e *Editor) setRaw(s string) {
+	e.rawBuffer = stringToRunes(s)
 }
 
 func (e *Editor) Edit(s string) (string, error) {
 	e.differ = diffmatchpatch.New()
-	e.contentBuffer = e.stringToRunes(s)
+	e.rawBuffer = stringToRunes(s)
 	e.redraw()
 	e.setCursor()
 	e.Screen.Show()
