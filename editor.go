@@ -24,6 +24,17 @@ var (
 	colorTagPattern   = regexp.MustCompile("<color:([A-Fa-f0-9]{6,6}):([A-Fa-f0-9]{6,6})>")
 )
 
+const (
+	DefaultHelpMessage = `Ctrl-a: Toggle this help view
+Ctrl-w: Close editor
+🡐 🡒 🡑 🡓, Ctrl-🡐 🡒 🡑 🡓, PgUp, PgDown, Home, End: Cursor movement
+Delete, Backspace: Remove single character
+Shift-[cursor movement]: Select
+Esc, Ctrl-c, Ctrl-x, Ctrl-v: Unselect, Copy, Cut, Paste
+Tab: Insert spaces to next 4-wide tab
+Ctrl-z, Ctrl-y: Undo, Redo`
+)
+
 func Escape(s string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;")
 }
@@ -74,9 +85,68 @@ type patch struct {
 	patches []diffmatchpatch.Patch
 }
 
+type popup struct {
+	message string
+}
+
+func (p *popup) draw(s tcell.Screen) {
+	width, height := s.Size()
+	lines := strings.Split(p.message, "\n")
+	lineWidth := 0
+	for _, line := range lines {
+		if width := len([]rune(line)); width > lineWidth {
+			lineWidth = width
+		}
+	}
+	top, left, bottom, right := 0, 0, height-1, width-1
+	if len(lines)+2 < height {
+		top = (height - len(lines) - 2) / 2
+		bottom = top + len(lines) + 1
+	}
+	if lineWidth+2 < width {
+		left = (width - lineWidth - 2) / 2
+		right = left + lineWidth + 1
+	}
+	for x := left; x <= right; x++ {
+		for y := top; y <= bottom; y++ {
+			if x == left && y == top {
+				s.SetContent(x, y, '╔', nil, tcell.StyleDefault)
+			} else if x == left && y == bottom {
+				s.SetContent(x, y, '╚', nil, tcell.StyleDefault)
+			} else if x == right && y == top {
+				s.SetContent(x, y, '╗', nil, tcell.StyleDefault)
+			} else if x == right && y == bottom {
+				s.SetContent(x, y, '╝', nil, tcell.StyleDefault)
+			} else if x == left || x == right {
+				s.SetContent(x, y, '║', nil, tcell.StyleDefault)
+			} else if y == top || y == bottom {
+				s.SetContent(x, y, '═', nil, tcell.StyleDefault)
+			} else {
+				hasChar := false
+				if y-top-1 < len(lines) {
+					line := []rune(lines[y-top-1])
+					if x-left-1 < len(line) {
+						s.SetContent(x, y, line[x-left-1], nil, tcell.StyleDefault)
+						hasChar = true
+					}
+				}
+				if !hasChar {
+					s.SetContent(x, y, ' ', nil, tcell.StyleDefault)
+				}
+			}
+		}
+	}
+}
+
+func (e *Editor) toggleHelp() {
+	defer e.redraw()
+	e.hideHelp = !e.hideHelp
+}
+
 type Editor struct {
 	Screen      tcell.Screen
 	EventFilter func(tcell.Event) []tcell.Event
+	HelpMessage string
 
 	// Edited text: [line][rune]
 	rawBuffer [][]rune
@@ -95,6 +165,8 @@ type Editor struct {
 	redoPatches []patch
 	cursor      point
 	differ      *diffmatchpatch.DiffMatchPatch
+	hideHelp    bool
+	popups      []*popup
 }
 
 func (e *Editor) runeAt(screenPoint point) rune {
@@ -498,6 +570,8 @@ func (e *Editor) pollKeys() {
 					e.cursor.x = len(e.screenBuffer[e.cursor.y])
 					e.redraw()
 					e.setCursor()
+				case tcell.KeyCtrlA:
+					e.toggleHelp()
 				case tcell.KeyCtrlZ:
 					storeUndo = false
 					clearRedo = false
@@ -1067,6 +1141,18 @@ func (e *Editor) redraw() {
 		for x := 0; x < width; x++ {
 			e.Screen.SetContent(x, y, ' ', nil, tcell.StyleDefault)
 		}
+	}
+	for _, popup := range e.popups {
+		popup.draw(e.Screen)
+	}
+	if !e.hideHelp {
+		msg := DefaultHelpMessage
+		if e.HelpMessage != "" {
+			msg = e.HelpMessage
+		}
+		(&popup{
+			message: msg,
+		}).draw(e.Screen)
 	}
 }
 
